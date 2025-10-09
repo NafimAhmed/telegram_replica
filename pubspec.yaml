@@ -37,6 +37,8 @@ dependencies:
   country_picker: ^2.0.20
   http: ^1.2.0
   shared_preferences: ^2.3.3
+  easy_localization: ^3.0.7
+  translator: ^1.0.0
 
 dev_dependencies:
   flutter_test:

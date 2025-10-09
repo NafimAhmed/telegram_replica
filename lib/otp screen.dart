@@ -58,7 +58,7 @@ class _OTPScreenState extends State<OTPScreen> {
           "last_name": lastName ?? '',
           "username": username ?? '',
           "phone": phone ?? '',
-          "avatar": "assets/panda.jpg",
+          "avatar": "",
           "timestamp": DateTime.now().millisecondsSinceEpoch
         };
 
