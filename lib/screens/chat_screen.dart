@@ -466,8 +466,22 @@ class _ChatScreenState extends State<ChatScreen> {
             const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
             child: Row(
               children: [
+                //  InkWell(
+                //      onTap: (){
+                //        // Navigator.pop(context);
+                //        _pickFromGallery();
+                //      },
+                //      child: Icon(Icons.photo, color: Colors.green)),
+                // SizedBox(width: 5,),
+                // InkWell(
+                //     onTap: (){
+                //       // Navigator.pop(context);
+                //       _pickFromCamera();
+                //     },
+                //     child: Icon(Icons.camera_alt, color: Colors.green)),
+                // SizedBox(width: 5,),
                 IconButton(
-                  icon: const Icon(Icons.attach_file,
+                  icon: const Icon(Icons.add,
                       color: Colors.green),
                   onPressed: _showSourceDialog,
                 ),
