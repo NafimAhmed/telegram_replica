@@ -115,7 +115,10 @@ class _TelegraphHomeState extends State<TelegraphHome>
       child: ListView.builder(
         itemCount: p.dialogs.length,
         itemBuilder: (context, i) {
+          print('dfkdkfldkfkd 12345679581245-----');
+          print(p.dialogs.length,);
           final d = p.dialogs[i];
+          print(d["access_hash"],);
           final lastMsg = d["last_message"] ?? "";
 
           return ListTile(
@@ -152,6 +155,7 @@ class _TelegraphHomeState extends State<TelegraphHome>
                 : null,
             onTap: () {
               final chatIdValue = d["id"];
+              final accessHash = d["access_hash"];
               if (chatIdValue == null) {
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(
@@ -171,6 +175,10 @@ class _TelegraphHomeState extends State<TelegraphHome>
                         ? chatIdValue
                         : int.tryParse(chatIdValue.toString()) ?? 0,
                     name: d["name"],
+                    username: d["username"],
+                      accessHash:accessHash is int
+                          ? accessHash
+                          : int.tryParse(accessHash.toString()) ?? 0,
                   ),
                 ),
               );

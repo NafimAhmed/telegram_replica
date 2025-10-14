@@ -424,6 +424,8 @@ class TelegraphProvider with ChangeNotifier {
 
       if (res.statusCode == 200) {
         final data = json.decode(res.body);
+        print('dkfdlkfldkf1213456');
+        print(data);
 
         if (data["dialogs"] is List) {
           // ✅ Background isolate parsing
@@ -477,6 +479,7 @@ class TelegraphProvider with ChangeNotifier {
       return {
         "id": d["id"],
         "name": (d["name"] ?? "Unknown").toString(),
+        "access_hash": d["access_hash"],
         "username": user.toString(),
         "last_message": textMsg,
         "unread_count": d["unread_count"] ?? 0,
@@ -544,9 +547,10 @@ class TelegraphProvider with ChangeNotifier {
 
   ///// chat fach Massage
 
-  Future<void> fetchMessages(String phone, int chatId) async {
+  Future<void> fetchMessages(String phone, int chatId, int accessHash) async {
     try {
-      final url = Uri.parse("$baseUrl/messages?phone=$phone&chat_id=$chatId");
+      final url = Uri.parse("$baseUrl/messages?phone=+$phone&chat_id=$chatId&access_hash=$accessHash");
+      print(url);
       final res = await http.get(url);
       if (res.statusCode == 200) {
         final data = json.decode(res.body);
@@ -565,6 +569,31 @@ class TelegraphProvider with ChangeNotifier {
       }
     } catch (e) {
       print("❌ Fetch messages error: $e");
+    }
+  }
+
+  Future<void> sendMessage(String phone, String to, String text) async {
+    try {
+      final url = Uri.parse("$baseUrl/send");
+
+      var req = http.MultipartRequest('POST', url)
+        ..fields['phone'] = phone
+        ..fields['to'] = to
+        ..fields['text'] = text;
+
+      final res = await req.send();
+      final body = await res.stream.bytesToString();
+
+      debugPrint("📨 Send API Response: $body");
+
+      if (res.statusCode == 200) {
+        final data = json.decode(body);
+        debugPrint("✅ Message Sent Successfully: ${data.toString()}");
+      } else {
+        debugPrint("❌ Send Failed [${res.statusCode}]: $body");
+      }
+    } catch (e) {
+      debugPrint("⚠️ Send Message Error: $e");
     }
   }
 
