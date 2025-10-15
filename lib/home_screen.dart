@@ -344,6 +344,7 @@ class _TelegraphDrawerState extends State<TelegraphDrawer> {
                                   style: const TextStyle(
                                       color: Colors.black54, fontSize: 12),
                                 ),
+
                                 trailing: IconButton(
                                   icon: const Icon(Icons.logout,
                                       color: Colors.redAccent, size: 20),

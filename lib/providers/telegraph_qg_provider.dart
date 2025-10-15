@@ -311,6 +311,8 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:translator/translator.dart';
 
+import '../screens/auth_screen/phone_login_screen.dart';
+
 class TelegraphProvider with ChangeNotifier {
   String firstName = "";
   String lastName = "";
@@ -478,7 +480,7 @@ class TelegraphProvider with ChangeNotifier {
 
       return {
         "id": d["id"],
-        "name": (d["name"] ?? "Unknown").toString(),
+        "name": (d["first_name"] ?? "Unknown").toString(),
         "access_hash": d["access_hash"],
         "username": user.toString(),
         "last_message": textMsg,
@@ -513,6 +515,7 @@ class TelegraphProvider with ChangeNotifier {
   }
 
   // ✅ LOGOUT
+
   Future<void> logoutAccount(int index, BuildContext context) async {
     final prefs = await SharedPreferences.getInstance();
     final removed = accounts[index];
@@ -520,32 +523,85 @@ class TelegraphProvider with ChangeNotifier {
 
     try {
       final url = Uri.parse("$baseUrl/logout");
-      await http.post(url,
-          headers: {"Content-Type": "application/json"},
-          body: json.encode({"phone": phone}));
+      await http.post(
+        url,
+        headers: {"Content-Type": "application/json"},
+        body: json.encode({"phone": phone}),
+      );
     } catch (e) {
       debugPrint("⚠️ Logout API error: $e");
     }
 
+    // 🔹 Remove from local list
     accounts.removeAt(index);
     await prefs.setString('accounts', json.encode(accounts));
 
+    // 🔹 যদি সব মুছে যায় → Login screen-এ পাঠাবে
     if (accounts.isEmpty) {
       await prefs.clear();
-      Navigator.pushNamedAndRemoveUntil(context, '/login', (route) => false);
-    } else {
-      final next = accounts.first;
-      await loadUser({
-        "first_name": next["first_name"] ?? "",
-        "last_name": next["last_name"] ?? "",
-        "username": next["username"] ?? "",
-        "phone_number": next["phone"] ?? "",
-      });
-      Navigator.pop(context);
+      if (context.mounted) {
+        Navigator.pushAndRemoveUntil(
+          context,
+          MaterialPageRoute(builder: (_) => const PhoneLoginScreen()),
+              (route) => false,
+        );
+      }
+      return;
+    }
+
+    // 🔹 অন্যথায়, পরের account কে active করবে
+    final next = accounts.first;
+    await loadUser({
+      "first_name": next["first_name"] ?? "",
+      "last_name": next["last_name"] ?? "",
+      "username": next["username"] ?? "",
+      "phone_number": next["phone"] ?? "",
+    });
+
+    if (context.mounted) {
+      Navigator.pop(context); // Drawer বন্ধ করবে
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("✅ Switched to ${next['first_name'] ?? 'next'} account"),
+          duration: const Duration(seconds: 1),
+        ),
+      );
     }
   }
 
-  ///// chat fach Massage
+  // Future<void> logoutAccount(int index, BuildContext context) async {
+  //   final prefs = await SharedPreferences.getInstance();
+  //   final removed = accounts[index];
+  //   final phone = removed["phone"] ?? "";
+  //
+  //   try {
+  //     final url = Uri.parse("$baseUrl/logout");
+  //     await http.post(url,
+  //         headers: {"Content-Type": "application/json"},
+  //         body: json.encode({"phone": phone}));
+  //   } catch (e) {
+  //     debugPrint("⚠️ Logout API error: $e");
+  //   }
+  //
+  //   accounts.removeAt(index);
+  //   await prefs.setString('accounts', json.encode(accounts));
+  //
+  //   if (accounts.isEmpty) {
+  //     await prefs.clear();
+  //     Navigator.pushNamedAndRemoveUntil(context, '/login', (route) => false);
+  //   } else {
+  //     final next = accounts.first;
+  //     await loadUser({
+  //       "first_name": next["first_name"] ?? "",
+  //       "last_name": next["last_name"] ?? "",
+  //       "username": next["username"] ?? "",
+  //       "phone_number": next["phone"] ?? "",
+  //     });
+  //     Navigator.pop(context);
+  //   }
+  // }
+
+  /// chat fach Massage
 
   Future<void> fetchMessages(String phone, int chatId, int accessHash) async {
     try {
