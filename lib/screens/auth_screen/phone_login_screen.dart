@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../../home_screen.dart';
 import '../../otp screen.dart';
 import '../../providers/telegraph_qg_provider.dart';
+import 'qr_authentication.dart';
 
 class PhoneLoginScreen extends StatefulWidget {
   const PhoneLoginScreen({super.key});
@@ -164,6 +165,26 @@ class _PhoneLoginScreenState extends State<PhoneLoginScreen> {
                       : const Icon(Icons.arrow_forward),
                 ),
               ),
+
+
+
+
+              InkWell(
+                onTap: (){
+
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const QrLoginScreen()),
+
+                  );
+
+                },
+                  child: Text('login with qr code'),
+              ),
+
+
+
+
             ],
           ),
         ),
