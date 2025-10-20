@@ -298,23 +298,33 @@ class TelegraphProvider with ChangeNotifier {
   // }
 
   /// chat fach Massage
+  ///
+  ///
 
   Future<void> fetchMessages(String phone, int chatId, int accessHash) async {
     try {
-      final url = Uri.parse("$baseUrl/messages?phone=+$phone&chat_id=$chatId&access_hash=$accessHash");
-      print(url);
+      final url = Uri.parse(
+          "$baseUrl/messages?phone=$phone&chat_id=$chatId&access_hash=$accessHash");
+      print("📥 Fetching → $url");
+
       final res = await http.get(url);
       if (res.statusCode == 200) {
         final data = json.decode(res.body);
-        messages = (data["messages"] ?? [])
-            .map<Map<String, dynamic>>((m) => {
-          "text": m["text"] ?? "",
-          "is_out": m["is_out"] ?? false,
-          "time": m["date"] ?? "",
-        })
-            .toList()
-            .reversed
-            .toList();
+        final List raw = data["messages"] ?? [];
+
+        messages = raw.map<Map<String, dynamic>>((m) {
+          final type = m["media_type"] ?? "text";
+          return {
+            "id": m["id"],
+            "text": m["text"] ?? "",
+            "is_out": m["is_out"] ?? false,
+            "time": m["date"] ?? "",
+            "type": type,
+            "url": m["media_link"],
+            "sender_name": m["sender_name"] ?? "",
+          };
+        }).toList().reversed.toList();
+
         notifyListeners();
       } else {
         print("❌ Server error: ${res.statusCode}");
@@ -323,6 +333,31 @@ class TelegraphProvider with ChangeNotifier {
       print("❌ Fetch messages error: $e");
     }
   }
+
+  // Future<void> fetchMessages(String phone, int chatId, int accessHash) async {
+  //   try {
+  //     final url = Uri.parse("$baseUrl/messages?phone=+$phone&chat_id=$chatId&access_hash=$accessHash");
+  //     print(url);
+  //     final res = await http.get(url);
+  //     if (res.statusCode == 200) {
+  //       final data = json.decode(res.body);
+  //       messages = (data["messages"] ?? [])
+  //           .map<Map<String, dynamic>>((m) => {
+  //         "text": m["text"] ?? "",
+  //         "is_out": m["is_out"] ?? false,
+  //         "time": m["date"] ?? "",
+  //       })
+  //           .toList()
+  //           .reversed
+  //           .toList();
+  //       notifyListeners();
+  //     } else {
+  //       print("❌ Server error: ${res.statusCode}");
+  //     }
+  //   } catch (e) {
+  //     print("❌ Fetch messages error: $e");
+  //   }
+  // }
 
   Future<void> sendMessage(String phone, String to, String text) async {
     try {
