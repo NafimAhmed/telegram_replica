@@ -25,6 +25,20 @@ class TelegraphProvider with ChangeNotifier {
 
   bool _initialized = false;
 
+  // bool _isTyping = false;
+  // bool get isTyping => _isTyping;
+  //
+  // void setTyping(bool val) {
+  //   _isTyping = val;
+  //   notifyListeners();
+  // }
+
+// Add a new message to the list (real-time)
+  void addMessage(Map<String, dynamic> msg) {
+    messages.insert(0, msg); // reversed list
+    notifyListeners();
+  }
+
   // ✅ INITIALIZE
   Future<void> initProvider() async {
     if (_initialized) return;

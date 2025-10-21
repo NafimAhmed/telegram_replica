@@ -229,7 +229,7 @@ class TelegramApp extends StatelessWidget {
 
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: "Telegram Multi Account",
+      title: "TG Hub",
       themeMode: p.isDark ? ThemeMode.dark : ThemeMode.light,
       darkTheme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: const Color(0xFF1E2429),
