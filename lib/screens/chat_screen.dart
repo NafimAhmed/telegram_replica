@@ -1037,6 +1037,8 @@
 //
 //
 
+
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
@@ -1068,6 +1070,11 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
+  // ==== CONFIG ====
+  static const String _wsUrl = 'ws://192.168.0.247:8080/chat_ws';
+  static const String _apiBase = 'http://192.168.0.247:8080'; // <- change if needed
+  static const Duration _wsPingEvery = Duration(seconds: 20);
+
   final ScrollController _scrollController = ScrollController();
   final TextEditingController _msgCtrl = TextEditingController();
   final ImagePicker _picker = ImagePicker();
@@ -1078,6 +1085,13 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _typing = false;
   int? _uploadingMsgIndex;
 
+  // WS helpers
+  Timer? _pingTimer;
+  Timer? _reconnectTimer;
+  int _reconnectAttempt = 0;
+  final Set<String> _seenIds = {}; // for de-dupe (server IDs or temp ids)
+  final String _clientInstance = DateTime.now().millisecondsSinceEpoch.toString();
+
   @override
   void initState() {
     super.initState();
@@ -1087,89 +1101,173 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    _pingTimer?.cancel();
+    _reconnectTimer?.cancel();
     _socket?.close();
     super.dispose();
   }
 
   // ================================
-  // 🔌 WebSocket Connect
+  // 🔌 WebSocket Connect (self-healing)
   // ================================
   Future<void> _connectWebSocket() async {
     try {
-      _socket = await WebSocket.connect('ws://192.168.0.247:8080/chat_ws');
+      _reconnectTimer?.cancel();
+      _socket = await WebSocket.connect(_wsUrl);
+      _reconnectAttempt = 0;
       debugPrint("✅ WS Connected");
 
+      // Init frame (server expects this as first message)
       _socket!.add(jsonEncode({
         "phone": widget.phone,
         "chat_id": widget.chatId,
         "access_hash": widget.accessHash,
       }));
 
-      _socket!.listen((raw) {
-        if (!mounted) return;
-        final provider = Provider.of<TelegraphProvider>(context, listen: false);
-
-        try {
-          final data = jsonDecode(raw);
-
-          // Ignore heartbeat
-          if (data["action"] == "_hb") return;
-
-          // Typing events
-          if (data["action"] == "typing") {
-            setState(() => _typing = true);
-            return;
-          }
-          if (data["action"] == "typing_stopped") {
-            setState(() => _typing = false);
-            return;
-          }
-
-          // Upload progress
-          if (data["action"] == "upload_progress") {
-            if (_uploadingMsgIndex != null &&
-                _uploadingMsgIndex! < provider.messages.length) {
-              provider.messages[_uploadingMsgIndex!]["progress"] = data["progress"];
-              provider.notifyListeners();
-            }
-            return;
-          }
-
-          // Status/listening
-          if (data["status"] == "listening") return;
-
-          // Primary message
-          if (data.containsKey("id")) {
-            final mediaType = data["media_type"] ?? "text";
-            provider.messages.insert(0, {
-              "id": data["id"],
-              "text": data["text"] ?? "",
-              "is_out": data["is_out"] ?? false,
-              "time": data["date"] ?? DateTime.now().toString(),
-              "type": mediaType,
-              "url": data["media_link"],
-            });
-            provider.notifyListeners();
-          }
-        } catch (e) {
-          debugPrint("⚠️ WS parse error: $e");
+      // Start server ping (keep-alive)
+      _pingTimer?.cancel();
+      _pingTimer = Timer.periodic(_wsPingEvery, (_) {
+        if (_socket?.readyState == WebSocket.open) {
+          _socket!.add(jsonEncode({"action": "ping"}));
         }
-      }, onDone: () {
-        Future.delayed(const Duration(seconds: 3), _connectWebSocket);
-      }, onError: (err) {
-        Future.delayed(const Duration(seconds: 5), _connectWebSocket);
       });
+
+      _socket!.listen(
+            (raw) => _handleWsFrame(raw),
+        onDone: _scheduleReconnect,
+        onError: (err) {
+          debugPrint("⚠️ WS error: $err");
+          _scheduleReconnect();
+        },
+        cancelOnError: true,
+      );
     } catch (e) {
-      Future.delayed(const Duration(seconds: 5), _connectWebSocket);
+      debugPrint("⚠️ WS connect failed: $e");
+      _scheduleReconnect();
+    }
+  }
+
+  void _scheduleReconnect([_]) {
+    _pingTimer?.cancel();
+    _reconnectAttempt++;
+    final delay = Duration(seconds: _reconnectBackoffSeconds(_reconnectAttempt));
+    debugPrint("↩️ Reconnect in ${delay.inSeconds}s (attempt $_reconnectAttempt)");
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(delay, _connectWebSocket);
+  }
+
+  int _reconnectBackoffSeconds(int n) {
+    final v = 1 << (n.clamp(0, 5)); // 1,2,4,8,16,32
+    return v > 30 ? 30 : v;
+  }
+
+  // ================================
+  // 📨 Handle WS frames
+  // ================================
+  void _handleWsFrame(String raw) {
+    if (!mounted) return;
+    final provider = Provider.of<TelegraphProvider>(context, listen: false);
+
+    try {
+      final data = jsonDecode(raw);
+
+      // Heartbeat or pong
+      if (data["action"] == "_hb" || data["status"] == "pong") return;
+
+      // Typing events
+      if (data["action"] == "typing") {
+        setState(() => _typing = true);
+        return;
+      }
+      if (data["action"] == "typing_stopped") {
+        setState(() => _typing = false);
+        return;
+      }
+
+      // Upload progress for our last uploading bubble
+      if (data["action"] == "upload_progress") {
+        if (_uploadingMsgIndex != null &&
+            _uploadingMsgIndex! < provider.messages.length) {
+          provider.messages[_uploadingMsgIndex!]["progress"] = data["progress"];
+          provider.notifyListeners();
+        }
+        return;
+      }
+
+      // Listener ack
+      if (data["status"] == "listening") return;
+
+      // SEED: initial messages pushed by server
+      if (data["action"] == "seed" && data["messages"] is List) {
+        final List<dynamic> arr = data["messages"];
+        // server sends oldest → newest. Our ListView is reverse:true (newest at top),
+        // so we'll add from last to first to keep newest at index 0.
+        for (int i = arr.length - 1; i >= 0; i--) {
+          final mapped = _mapServerMessage(arr[i]);
+          if (mapped == null) continue;
+          final id = mapped["id"]?.toString();
+          if (id != null && _seenIds.contains(id)) continue;
+          if (id != null) _seenIds.add(id);
+          provider.messages.insert(0, mapped);
+        }
+        provider.notifyListeners();
+        return;
+      }
+
+      // PRIMARY MESSAGE (new_message OR generic with id)
+      if (data["action"] == "new_message" || data.containsKey("id")) {
+        final mapped = _mapServerMessage(data);
+        if (mapped == null) return;
+
+        final id = mapped["id"]?.toString();
+        // de-dupe: if we already have same server id, skip
+        if (id != null && _seenIds.contains(id)) return;
+        if (id != null) _seenIds.add(id);
+
+        // If it's our own pending text/file (no id), replace first pending bubble by text match
+        final isOut = mapped["is_out"] == true;
+        if (isOut) {
+          final idx = provider.messages.indexWhere((m) {
+            final bool pending = (m["pending"] == true) && (m["is_out"] == true);
+            final sameText = (m["text"] ?? "") == (mapped["text"] ?? "");
+            return pending && sameText;
+          });
+          if (idx != -1) {
+            provider.messages[idx] = mapped;
+            provider.notifyListeners();
+            return;
+          }
+        }
+
+        provider.messages.insert(0, mapped);
+        provider.notifyListeners();
+        return;
+      }
+
+      // (Older path) Explicit call_event
+      if (data["action"] == "call_event") {
+        final mapped = _mapCallEvent(data);
+        if (mapped == null) return;
+        final id = mapped["id"]?.toString();
+        if (id != null && _seenIds.contains(id)) return;
+        if (id != null) _seenIds.add(id);
+        provider.messages.insert(0, mapped);
+        provider.notifyListeners();
+        return;
+      }
+    } catch (e) {
+      debugPrint("⚠️ WS parse error: $e");
     }
   }
 
   // ================================
-  // 📨 Load messages
+  // 📨 Load messages (initial REST)
   // ================================
   Future<void> _fetchAndLoad() async {
     final provider = Provider.of<TelegraphProvider>(context, listen: false);
     await provider.fetchMessages(widget.phone, widget.chatId, widget.accessHash);
+    // Provider-এর fetch যদি already normalize না করে থাকে, চাইলে এখানে normalize করতে পারেন।
+    // ধরি আপনার provider আগের মতোই ঠিক ঢুকিয়ে দিচ্ছে।
     setState(() => _loading = false);
   }
 
@@ -1185,49 +1283,53 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final payload = {
       "action": "send",
+      "text": text,
+      // সার্ভারের নতুন /chat_ws এ init-এ phone/chat_id/ah দেওয়া থাকে, "send"-এ আবার দিতে হয় না।
+      // কিন্তু backward compatible রাখলাম:
       "phone": widget.phone,
       "chat_id": widget.chatId,
       "access_hash": widget.accessHash,
-      "text": text,
+      "client_instance": _clientInstance,
     };
 
     try {
-      _socket?.add(jsonEncode(payload));
+      // optimistic pending bubble
       provider.messages.insert(0, {
+        "id": "pending:${DateTime.now().microsecondsSinceEpoch}",
         "text": text,
         "is_out": true,
-        "time": DateTime.now().toString(),
+        "time": DateTime.now().toIso8601String(),
         "type": "text",
+        "pending": true,
       });
+      _seenIds.add(provider.messages.first["id"].toString());
       provider.notifyListeners();
+
+      _socket?.add(jsonEncode(payload));
       _msgCtrl.clear();
     } catch (e) {
       debugPrint("⚠️ send text error: $e");
     } finally {
-      setState(() => _sending = false);
+      if (mounted) setState(() => _sending = false);
     }
   }
 
   // ================================
   // Typing events
   // ================================
+  Timer? _typingDebounce;
   void _typingStart() {
+    _typingDebounce?.cancel();
     if (_socket?.readyState == WebSocket.open) {
-      _socket!.add(jsonEncode({
-        "action": "typing_start",
-        "phone": widget.phone,
-        "chat_id": widget.chatId
-      }));
+      _socket!.add(jsonEncode({"action": "typing_start"}));
     }
+    // stop typing if idle 2s
+    _typingDebounce = Timer(const Duration(seconds: 2), _typingStop);
   }
 
   void _typingStop() {
     if (_socket?.readyState == WebSocket.open) {
-      _socket!.add(jsonEncode({
-        "action": "typing_stop",
-        "phone": widget.phone,
-        "chat_id": widget.chatId
-      }));
+      _socket!.add(jsonEncode({"action": "typing_stop"}));
     }
   }
 
@@ -1259,29 +1361,336 @@ class _ChatScreenState extends State<ChatScreen> {
 
       final provider = Provider.of<TelegraphProvider>(context, listen: false);
       provider.messages.insert(0, {
+        "id": "pending:${DateTime.now().microsecondsSinceEpoch}",
         "text": "",
         "is_out": true,
-        "time": DateTime.now().toString(),
-        "type": mime.startsWith('image/') ? "image" : "file",
+        "time": DateTime.now().toIso8601String(),
+        "type": mime.startsWith('image/') ? "image" : (mime.startsWith('video/') ? "video" : "file"),
         "local_path": file.path,
         "uploading": true,
         "progress": 0.0,
+        "pending": true,
       });
-      provider.notifyListeners();
       _uploadingMsgIndex = 0;
+      _seenIds.add(provider.messages.first["id"].toString());
+      provider.notifyListeners();
 
       _socket?.add(jsonEncode({
         "action": "send",
-        "phone": widget.phone,
-        "chat_id": widget.chatId,
-        "access_hash": widget.accessHash,
         "file_name": fileName,
         "file_base64": b64,
         "mime_type": mime,
+        // b/c older server versions used these in send:
+        "phone": widget.phone,
+        "chat_id": widget.chatId,
+        "access_hash": widget.accessHash,
+        "client_instance": _clientInstance,
       }));
     } catch (e) {
       debugPrint("⚠️ send file error: $e");
     }
+  }
+
+  // ================================
+  // Mapping helpers
+  // ================================
+  Map<String, dynamic>? _mapServerMessage(dynamic data) {
+    if (data == null) return null;
+
+    final id = data["id"] ?? data["msg_id"] ?? data["temp_id"];
+    final text = (data["text"] ?? "") as String;
+    final isOut = data["is_out"] == true || (data["direction"]?.toString() == "out");
+    final date = (data["date"] ?? DateTime.now().toIso8601String()).toString();
+    final mediaType = (data["media_type"] ?? data["type"] ?? "text").toString();
+    final mediaLink = data["media_link"];
+
+    if (mediaType == "call_audio" || mediaType == "call_video") {
+      final call = data["call"] ?? {};
+      return {
+        "id": id?.toString(),
+        "text": _formatCallTitle(call, mediaType),
+        "is_out": isOut,
+        "time": date,
+        "type": "call",
+        "call_status": call["status"],
+        "duration": call["duration"],
+        "direction": call["direction"], // incoming/outgoing
+      };
+    }
+
+    // Normal text/file/image/video
+    return {
+      "id": id?.toString(),
+      "text": text,
+      "is_out": isOut,
+      "time": date,
+      "type": _normalizeType(mediaType),
+      "url": _resolveUrl(mediaLink),
+      "pending": false,
+    };
+  }
+
+  Map<String, dynamic>? _mapCallEvent(dynamic data) {
+    final id = data["id"];
+    final status = data["status"];
+    final direction = data["direction"];
+    final duration = data["duration"];
+    final isVideo = data["is_video"] == true;
+    final date = (data["date"] ?? DateTime.now().toIso8601String()).toString();
+
+    return {
+      "id": id?.toString(),
+      "text": isVideo ? "Video call" : "Voice call",
+      "is_out": (direction == "outgoing"),
+      "time": date,
+      "type": "call",
+      "call_status": status,
+      "duration": duration,
+      "direction": direction,
+    };
+  }
+
+  String _normalizeType(String t) {
+    switch (t) {
+      case "image":
+      case "video":
+      case "audio":
+      case "voice":
+      case "sticker":
+      case "file":
+        return t;
+      default:
+        return "text";
+    }
+  }
+
+  String? _resolveUrl(dynamic url) {
+    if (url == null) return null;
+    final u = url.toString();
+    if (u.startsWith('http://') || u.startsWith('https://')) return u;
+    if (u.startsWith('/')) return '$_apiBase$u';
+    return '$_apiBase/$u';
+  }
+
+  String _formatCallTitle(Map call, String mediaType) {
+    final status = (call["status"] ?? "").toString();
+    final dur = call["duration"];
+    final sec = (dur is num) ? dur.toInt() : null;
+    final dir = (call["direction"] ?? "").toString(); // incoming/outgoing
+    final t = mediaType == "call_video" ? "Video call" : "Voice call";
+    final sd = (sec != null && sec > 0) ? " • ${_fmtDur(sec)}" : "";
+    final d = dir.isNotEmpty ? (dir == "incoming" ? "Incoming" : "Outgoing") : "";
+    return "$t • $status${sd}${d.isNotEmpty ? " • $d" : ""}";
+    // Example: "Voice call • ended • 00:02:31 • Outgoing"
+  }
+
+  String _fmtDur(int s) {
+    final h = s ~/ 3600;
+    final m = (s % 3600) ~/ 60;
+    final sec = s % 60;
+    if (h > 0) {
+      return "${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}";
+    }
+    return "${m.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}";
+  }
+
+  // ================================
+  // Message Bubble
+  // ================================
+  Widget _bubbleContent(Map<String, dynamic> msg, bool isOut) {
+    final type = (msg["type"] ?? "text") as String;
+    final text = (msg["text"] ?? "") as String;
+
+    if (type == "call") {
+      final status = msg["call_status"]?.toString() ?? "";
+      final direction = msg["direction"]?.toString() ?? "";
+      IconData icon;
+      Color color;
+
+      if (status == "missed") {
+        icon = Icons.call_missed;
+        color = Colors.red;
+      } else if (status == "ended") {
+        icon = Icons.call_end;
+        color = Colors.green;
+      } else if (status == "busy") {
+        icon = Icons.call_end;
+        color = Colors.orange;
+      } else {
+        icon = Icons.phone;
+        color = Colors.blueGrey;
+      }
+
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: color, size: 20),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              "$text (${direction == "incoming" ? "Incoming" : "Outgoing"})",
+              style: TextStyle(
+                color: isOut ? Colors.white : Colors.black87,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    if (type == "image") {
+      final localPath = msg["local_path"];
+      final url = msg["url"];
+      const w = 220.0, h = 260.0;
+      final uploading = msg["uploading"] == true;
+      final progress = (msg["progress"] ?? 0.0) as num;
+
+      Widget imageChild;
+      if (localPath != null) {
+        imageChild = Image.file(File(localPath), width: w, height: h, fit: BoxFit.cover);
+      } else if (url != null) {
+        imageChild = Image.network(_resolveUrl(url)!, width: w, height: h, fit: BoxFit.cover);
+      } else {
+        imageChild = Container(width: w, height: h, color: Colors.grey, child: const Icon(Icons.image));
+      }
+
+      return Stack(
+        children: [
+          ClipRRect(borderRadius: BorderRadius.circular(10), child: imageChild),
+          if (uploading)
+            Positioned.fill(
+              child: Container(
+                alignment: Alignment.bottomCenter,
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: LinearProgressIndicator(
+                    value: progress.clamp(0, 100) / 100.0,
+                    minHeight: 5,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      );
+    }
+
+    if (type == "video") {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.videocam),
+          const SizedBox(width: 8),
+          Text("Video", style: TextStyle(color: isOut ? Colors.white : Colors.black87)),
+        ],
+      );
+    }
+
+    if (type == "audio" || type == "voice") {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.audiotrack),
+          const SizedBox(width: 8),
+          Text(type == "voice" ? "Voice message" : "Audio",
+              style: TextStyle(color: isOut ? Colors.white : Colors.black87)),
+        ],
+      );
+    }
+
+    // text / file / sticker (basic)
+    return Text(text, style: TextStyle(color: isOut ? Colors.white : Colors.black87, fontSize: 15));
+  }
+
+  // ================================
+  // UI
+  // ================================
+  @override
+  Widget build(BuildContext context) {
+    final provider = Provider.of<TelegraphProvider>(context);
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFE5DDD5),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF008069),
+        title: Row(children: [
+          const CircleAvatar(backgroundColor: Colors.white, child: Icon(Icons.person, color: Colors.black)),
+          const SizedBox(width: 10),
+          Text(widget.name, style: const TextStyle(color: Colors.white, fontSize: 18)),
+          if (_typing)
+            const Padding(
+              padding: EdgeInsets.only(left: 8),
+              child: Text("typing...", style: TextStyle(color: Colors.white70, fontSize: 12)),
+            ),
+        ]),
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : Column(children: [
+        Expanded(
+          child: ListView.builder(
+            controller: _scrollController,
+            reverse: true, // newest at top
+            itemCount: provider.messages.length,
+            itemBuilder: (context, i) {
+              final msg = provider.messages[i];
+              final isOut = msg["is_out"] == true;
+              final time = (msg["time"] ?? "") as String;
+
+              return Align(
+                alignment: isOut ? Alignment.centerRight : Alignment.centerLeft,
+                child: Container(
+                  margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: isOut ? Colors.green.shade400 : Colors.grey.shade300,
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      _bubbleContent(msg, isOut),
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(
+                          time,
+                          style: TextStyle(color: isOut ? Colors.white70 : Colors.grey[700], fontSize: 11),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+        Container(
+          color: Colors.white,
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Row(children: [
+            IconButton(icon: const Icon(Icons.attach_file, color: Colors.green), onPressed: _showAttachmentMenu),
+            Expanded(
+              child: TextField(
+                controller: _msgCtrl,
+                onChanged: (v) => _typingStart(),
+                onEditingComplete: _typingStop,
+                decoration: const InputDecoration(hintText: "Type a message", border: InputBorder.none),
+              ),
+            ),
+            IconButton(
+              icon: _sending
+                  ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.send, color: Colors.green),
+              onPressed: _sending ? null : _sendText,
+            ),
+          ]),
+        ),
+      ]),
+    );
   }
 
   void _showAttachmentMenu() {
@@ -1309,199 +1718,12 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
     );
   }
-
-  // ================================
-  // Message Bubble
-  // ================================
-
-  Widget _bubbleContent(Map<String, dynamic> msg, bool isOut) {
-    final type = msg["type"] ?? "text";
-    final text = msg["text"] ?? "";
-
-    if (type == "call") {
-      final status = msg["call_status"] ?? "";
-      final direction = msg["direction"] ?? "";
-      IconData icon;
-      Color color;
-
-      if (status == "missed") {
-        icon = Icons.call_missed;
-        color = Colors.red;
-      } else if (status == "ended") {
-        icon = Icons.call_end;
-        color = Colors.green;
-      } else if (status == "busy") {
-        icon = Icons.call_end;
-        color = Colors.orange;
-      } else {
-        icon = Icons.phone;
-        color = Colors.blueGrey;
-      }
-
-      return Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, color: color, size: 20),
-          const SizedBox(width: 6),
-          Text(
-            "$text (${direction == "incoming" ? "Incoming" : "Outgoing"})",
-            style: TextStyle(
-              color: isOut ? Colors.white : Colors.black87,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-        ],
-      );
-    }
-
-    if (type == "image") {
-      final localPath = msg["local_path"];
-      final url = msg["url"];
-      final w = 220.0, h = 260.0;
-      return ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: localPath != null
-            ? Image.file(File(localPath), width: w, height: h, fit: BoxFit.cover)
-            : (url != null
-            ? Image.network(url, width: w, height: h, fit: BoxFit.cover)
-            : Container(
-          width: w,
-          height: h,
-          color: Colors.grey,
-          child: const Icon(Icons.image),
-        )),
-      );
-    }
-
-    return Text(
-      text,
-      style: TextStyle(color: isOut ? Colors.white : Colors.black87, fontSize: 15),
-    );
-  }
-  // Widget _bubbleContent(Map<String, dynamic> msg, bool isOut) {
-  //   final type = msg["type"] ?? "text";
-  //   final text = msg["text"] ?? "";
-  //
-  //   if (type == "image") {
-  //     final localPath = msg["local_path"];
-  //     final url = msg["url"];
-  //     return ClipRRect(
-  //       borderRadius: BorderRadius.circular(10),
-  //       child: localPath != null
-  //           ? Image.file(File(localPath), width: 220, height: 260, fit: BoxFit.cover)
-  //           : (url != null
-  //           ? Image.network(url, width: 220, height: 260, fit: BoxFit.cover)
-  //           : Container(width: 220, height: 260, color: Colors.grey, child: const Icon(Icons.image))),
-  //     );
-  //   }
-  //
-  //   return Text(
-  //     text,
-  //     style: TextStyle(color: isOut ? Colors.white : Colors.black87, fontSize: 15),
-  //   );
-  // }
-
-  // ================================
-  // UI
-  // ================================
-  @override
-  Widget build(BuildContext context) {
-    final provider = Provider.of<TelegraphProvider>(context);
-
-    return Scaffold(
-      backgroundColor: const Color(0xFFE5DDD5),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF008069),
-        title: Row(children: [
-          const CircleAvatar(
-              backgroundColor: Colors.white,
-              child: Icon(Icons.person, color: Colors.black)),
-          const SizedBox(width: 10),
-          Text(widget.name, style: const TextStyle(color: Colors.white, fontSize: 18)),
-          if (_typing)
-            const Padding(
-              padding: EdgeInsets.only(left: 8),
-              child: Text("typing...", style: TextStyle(color: Colors.white70, fontSize: 12)),
-            ),
-        ]),
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : Column(children: [
-        Expanded(
-          child: ListView.builder(
-            controller: _scrollController,
-            reverse: true,
-            itemCount: provider.messages.length,
-            itemBuilder: (context, i) {
-              final msg = provider.messages[i];
-              final isOut = msg["is_out"] == true;
-              final time = msg["time"] ?? "";
-
-              return Align(
-                alignment: isOut ? Alignment.centerRight : Alignment.centerLeft,
-                child: Container(
-                  margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: isOut ? Colors.green.shade400 : Colors.grey.shade300,
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      _bubbleContent(msg, isOut),
-                      Padding(
-                        padding: const EdgeInsets.only(top: 4),
-                        child: Text(time,
-                            style: TextStyle(color: isOut ? Colors.white70 : Colors.grey[700], fontSize: 11)),
-                      ),
-                    ],
-                  ),
-                ),
-              );
-            },
-          ),
-        ),
-        Container(
-          color: Colors.white,
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          child: Row(children: [
-            IconButton(
-              icon: const Icon(Icons.attach_file, color: Colors.green),
-              onPressed: _showAttachmentMenu,
-            ),
-            Expanded(
-              child: TextField(
-                controller: _msgCtrl,
-                onChanged: (v) => _typingStart(),
-                onEditingComplete: _typingStop,
-                decoration: const InputDecoration(
-                  hintText: "Type a message",
-                  border: InputBorder.none,
-                ),
-              ),
-            ),
-            IconButton(
-              icon: _sending
-                  ? const CircularProgressIndicator()
-                  : const Icon(Icons.send, color: Colors.green),
-              onPressed: _sendText,
-            ),
-          ]),
-        ),
-      ]),
-    );
-  }
 }
-
 
 
 // import 'dart:convert';
 // import 'dart:io';
-// import 'package:ag_taligram/url.dart';
 // import 'package:flutter/material.dart';
-// import 'package:http/http.dart' as http;
 // import 'package:image_picker/image_picker.dart';
 // import 'package:mime/mime.dart';
 // import 'package:path/path.dart' as p;
@@ -1538,9 +1760,7 @@ class _ChatScreenState extends State<ChatScreen> {
 //   bool _loading = true;
 //   bool _sending = false;
 //   bool _typing = false;
-//   double _uploadProgress = 0.0;
 //   int? _uploadingMsgIndex;
-//   Map<String, dynamic>? _replyToMsg;
 //
 //   @override
 //   void initState() {
@@ -1560,114 +1780,63 @@ class _ChatScreenState extends State<ChatScreen> {
 //   // ================================
 //   Future<void> _connectWebSocket() async {
 //     try {
-//       final wsUrl = 'ws://192.168.0.247:8080/chat_ws';
-//       _socket = await WebSocket.connect(wsUrl);
-//       debugPrint("✅ WS connected");
+//       _socket = await WebSocket.connect('ws://192.168.0.247:8080/chat_ws');
+//       debugPrint("✅ WS Connected");
 //
-//       final init = {
+//       _socket!.add(jsonEncode({
 //         "phone": widget.phone,
 //         "chat_id": widget.chatId,
 //         "access_hash": widget.accessHash,
-//       };
-//       _socket!.add(jsonEncode(init));
+//       }));
 //
-//       _socket!.listen((raw) async {
+//       _socket!.listen((raw) {
 //         if (!mounted) return;
 //         final provider = Provider.of<TelegraphProvider>(context, listen: false);
 //
 //         try {
 //           final data = jsonDecode(raw);
 //
-//           // 🟡 Upload progress
-//           if (data["action"] == "upload_progress") {
-//             final prog = (data["progress"] ?? 0).toDouble();
-//             setState(() => _uploadProgress = prog);
-//             if (_uploadingMsgIndex != null &&
-//                 _uploadingMsgIndex! < provider.messages.length) {
-//               provider.messages[_uploadingMsgIndex!]["progress"] = prog;
-//               provider.notifyListeners();
-//             }
-//             return;
-//           }
+//           // Ignore heartbeat
+//           if (data["action"] == "_hb") return;
 //
-//           // 🟢 Typing start
+//           // Typing events
 //           if (data["action"] == "typing") {
 //             setState(() => _typing = true);
 //             return;
 //           }
-//
-//           // 🔴 Typing stop
 //           if (data["action"] == "typing_stopped") {
 //             setState(() => _typing = false);
 //             return;
 //           }
 //
-//           // ☎️ Call event
-//           if (data["action"] == "call_event") {
-//             final status = data["status"] ?? "unknown";
-//             final direction = data["direction"] ?? "incoming";
-//             String displayText = "";
-//
-//             if (status == "missed") {
-//               displayText =
-//               direction == "incoming" ? "❌ Missed call" : "📞 Missed outgoing call";
-//             } else if (status == "ended") {
-//               final duration = data["duration"] ?? 0;
-//               displayText =
-//               direction == "incoming" ? "📞 Call ended ($duration sec)" : "📤 Call ended ($duration sec)";
-//             } else if (status == "canceled") {
-//               displayText = "🚫 Call canceled";
-//             } else if (status == "busy") {
-//               displayText = "📵 User busy";
-//             } else {
-//               displayText = "☎️ Call event";
-//             }
-//
-//             provider.messages.insert(0, {
-//               "id": data["id"],
-//               "text": displayText,
-//               "is_out": false,
-//               "time": data["date"] ?? DateTime.now().toString(),
-//               "type": "call",
-//               "call_status": status,
-//               "direction": direction,
-//             });
-//             provider.notifyListeners();
-//             return;
-//           }
-//
-//           // 📩 Normal message (text / media)
-//           if (data["action"] == "new_message") {
-//             if (data["chat_id"].toString() == widget.chatId.toString()) {
-//               final mediaType = data["media_type"] ?? "text";
-//               final fileUrl = data["file_url"];
-//               provider.messages.insert(0, {
-//                 "id": data["id"],
-//                 "text": data["text"] ?? "",
-//                 "is_out": false,
-//                 "time": data["date"] ?? DateTime.now().toString(),
-//                 "type": mediaType,
-//                 "url": fileUrl,
-//               });
-//               provider.notifyListeners();
-//             }
-//             return;
-//           }
-//
-//           // ✅ Sent confirmation
-//           if ((data["status"] ?? "").toString().startsWith("sent_")) {
-//             setState(() => _uploadProgress = 100.0);
+//           // Upload progress
+//           if (data["action"] == "upload_progress") {
 //             if (_uploadingMsgIndex != null &&
 //                 _uploadingMsgIndex! < provider.messages.length) {
-//               provider.messages[_uploadingMsgIndex!]["uploading"] = false;
-//               provider.messages[_uploadingMsgIndex!]["progress"] = 100.0;
+//               provider.messages[_uploadingMsgIndex!]["progress"] = data["progress"];
 //               provider.notifyListeners();
-//               _uploadingMsgIndex = null;
 //             }
 //             return;
 //           }
+//
+//           // Status/listening
+//           if (data["status"] == "listening") return;
+//
+//           // Primary message
+//           if (data.containsKey("id")) {
+//             final mediaType = data["media_type"] ?? "text";
+//             provider.messages.insert(0, {
+//               "id": data["id"],
+//               "text": data["text"] ?? "",
+//               "is_out": data["is_out"] ?? false,
+//               "time": data["date"] ?? DateTime.now().toString(),
+//               "type": mediaType,
+//               "url": data["media_link"],
+//             });
+//             provider.notifyListeners();
+//           }
 //         } catch (e) {
-//           debugPrint("⚠️ WS decode error: $e");
+//           debugPrint("⚠️ WS parse error: $e");
 //         }
 //       }, onDone: () {
 //         Future.delayed(const Duration(seconds: 3), _connectWebSocket);
@@ -1708,7 +1877,6 @@ class _ChatScreenState extends State<ChatScreen> {
 //
 //     try {
 //       _socket?.add(jsonEncode(payload));
-//
 //       provider.messages.insert(0, {
 //         "text": text,
 //         "is_out": true,
@@ -1725,47 +1893,7 @@ class _ChatScreenState extends State<ChatScreen> {
 //   }
 //
 //   // ================================
-//   // 📤 Send file
-//   // ================================
-//   Future<void> _sendFile(File file) async {
-//     try {
-//       final bytes = await file.readAsBytes();
-//       final b64 = base64Encode(bytes);
-//       final fileName = p.basename(file.path);
-//       final mime = lookupMimeType(file.path) ?? "application/octet-stream";
-//       final isImage = mime.startsWith('image/');
-//
-//       final provider = Provider.of<TelegraphProvider>(context, listen: false);
-//       provider.messages.insert(0, {
-//         "text": "",
-//         "is_out": true,
-//         "time": DateTime.now().toString(),
-//         "type": isImage ? "image" : "file",
-//         "local_path": file.path,
-//         "uploading": true,
-//         "progress": 0.0,
-//       });
-//       provider.notifyListeners();
-//       _uploadingMsgIndex = 0;
-//
-//       final payload = {
-//         "action": "send",
-//         "phone": widget.phone,
-//         "chat_id": widget.chatId,
-//         "access_hash": widget.accessHash,
-//         "file_name": fileName,
-//         "file_base64": b64,
-//         "mime_type": mime,
-//       };
-//
-//       _socket?.add(jsonEncode(payload));
-//     } catch (e) {
-//       debugPrint("⚠️ send file error: $e");
-//     }
-//   }
-//
-//   // ================================
-//   // Typing Events
+//   // Typing events
 //   // ================================
 //   void _typingStart() {
 //     if (_socket?.readyState == WebSocket.open) {
@@ -1788,7 +1916,7 @@ class _ChatScreenState extends State<ChatScreen> {
 //   }
 //
 //   // ================================
-//   // Picker
+//   // Picker & Send File
 //   // ================================
 //   Future<void> _ensurePerms() async {
 //     await [Permission.camera, Permission.photos, Permission.storage].request();
@@ -1800,23 +1928,43 @@ class _ChatScreenState extends State<ChatScreen> {
 //     if (img != null) await _sendFile(File(img.path));
 //   }
 //
-//
-//
-// //  new code add
-//
-//   // Future<void> _pickImages() async {
-//   //   await _ensurePerms();
-//   //   final imgs = await _picker.pickMultiImage(imageQuality: 80);
-//   //   for (final img in imgs) {
-//   //     await _sendFile(File(img.path));
-//   //   }
-//   // }
-//
 //   Future<void> _pickVideo() async {
 //     await _ensurePerms();
 //     final vid = await _picker.pickVideo(source: ImageSource.gallery);
-//     if (vid != null) {
-//       await _sendFile(File(vid.path));
+//     if (vid != null) await _sendFile(File(vid.path));
+//   }
+//
+//   Future<void> _sendFile(File file) async {
+//     try {
+//       final bytes = await file.readAsBytes();
+//       final b64 = base64Encode(bytes);
+//       final fileName = p.basename(file.path);
+//       final mime = lookupMimeType(file.path) ?? "application/octet-stream";
+//
+//       final provider = Provider.of<TelegraphProvider>(context, listen: false);
+//       provider.messages.insert(0, {
+//         "text": "",
+//         "is_out": true,
+//         "time": DateTime.now().toString(),
+//         "type": mime.startsWith('image/') ? "image" : "file",
+//         "local_path": file.path,
+//         "uploading": true,
+//         "progress": 0.0,
+//       });
+//       provider.notifyListeners();
+//       _uploadingMsgIndex = 0;
+//
+//       _socket?.add(jsonEncode({
+//         "action": "send",
+//         "phone": widget.phone,
+//         "chat_id": widget.chatId,
+//         "access_hash": widget.accessHash,
+//         "file_name": fileName,
+//         "file_base64": b64,
+//         "mime_type": mime,
+//       }));
+//     } catch (e) {
+//       debugPrint("⚠️ send file error: $e");
 //     }
 //   }
 //
@@ -1831,7 +1979,6 @@ class _ChatScreenState extends State<ChatScreen> {
 //             onTap: () {
 //               Navigator.pop(ctx);
 //               _pickImage();
-//               // _pickImages();
 //             },
 //           ),
 //           ListTile(
@@ -1847,10 +1994,10 @@ class _ChatScreenState extends State<ChatScreen> {
 //     );
 //   }
 //
+//   // ================================
+//   // Message Bubble
+//   // ================================
 //
-//   // ================================
-//   // Message Bubble Builder
-//   // ================================
 //   Widget _bubbleContent(Map<String, dynamic> msg, bool isOut) {
 //     final type = msg["type"] ?? "text";
 //     final text = msg["text"] ?? "";
@@ -1915,6 +2062,28 @@ class _ChatScreenState extends State<ChatScreen> {
 //       style: TextStyle(color: isOut ? Colors.white : Colors.black87, fontSize: 15),
 //     );
 //   }
+//   // Widget _bubbleContent(Map<String, dynamic> msg, bool isOut) {
+//   //   final type = msg["type"] ?? "text";
+//   //   final text = msg["text"] ?? "";
+//   //
+//   //   if (type == "image") {
+//   //     final localPath = msg["local_path"];
+//   //     final url = msg["url"];
+//   //     return ClipRRect(
+//   //       borderRadius: BorderRadius.circular(10),
+//   //       child: localPath != null
+//   //           ? Image.file(File(localPath), width: 220, height: 260, fit: BoxFit.cover)
+//   //           : (url != null
+//   //           ? Image.network(url, width: 220, height: 260, fit: BoxFit.cover)
+//   //           : Container(width: 220, height: 260, color: Colors.grey, child: const Icon(Icons.image))),
+//   //     );
+//   //   }
+//   //
+//   //   return Text(
+//   //     text,
+//   //     style: TextStyle(color: isOut ? Colors.white : Colors.black87, fontSize: 15),
+//   //   );
+//   // }
 //
 //   // ================================
 //   // UI
@@ -1932,13 +2101,11 @@ class _ChatScreenState extends State<ChatScreen> {
 //               backgroundColor: Colors.white,
 //               child: Icon(Icons.person, color: Colors.black)),
 //           const SizedBox(width: 10),
-//           Text(widget.name,
-//               style: const TextStyle(color: Colors.white, fontSize: 18)),
+//           Text(widget.name, style: const TextStyle(color: Colors.white, fontSize: 18)),
 //           if (_typing)
 //             const Padding(
 //               padding: EdgeInsets.only(left: 8),
-//               child: Text("typing...",
-//                   style: TextStyle(color: Colors.white70, fontSize: 12)),
+//               child: Text("typing...", style: TextStyle(color: Colors.white70, fontSize: 12)),
 //             ),
 //         ]),
 //       ),
@@ -1956,16 +2123,12 @@ class _ChatScreenState extends State<ChatScreen> {
 //               final time = msg["time"] ?? "";
 //
 //               return Align(
-//                 alignment:
-//                 isOut ? Alignment.centerRight : Alignment.centerLeft,
+//                 alignment: isOut ? Alignment.centerRight : Alignment.centerLeft,
 //                 child: Container(
-//                   margin: const EdgeInsets.symmetric(
-//                       vertical: 6, horizontal: 8),
+//                   margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
 //                   padding: const EdgeInsets.all(10),
 //                   decoration: BoxDecoration(
-//                     color: isOut
-//                         ? Colors.green.shade400
-//                         : Colors.grey.shade300,
+//                     color: isOut ? Colors.green.shade400 : Colors.grey.shade300,
 //                     borderRadius: BorderRadius.circular(14),
 //                   ),
 //                   child: Column(
@@ -1974,14 +2137,8 @@ class _ChatScreenState extends State<ChatScreen> {
 //                       _bubbleContent(msg, isOut),
 //                       Padding(
 //                         padding: const EdgeInsets.only(top: 4),
-//                         child: Text(
-//                           time,
-//                           style: TextStyle(
-//                               color: isOut
-//                                   ? Colors.white70
-//                                   : Colors.grey[700],
-//                               fontSize: 11),
-//                         ),
+//                         child: Text(time,
+//                             style: TextStyle(color: isOut ? Colors.white70 : Colors.grey[700], fontSize: 11)),
 //                       ),
 //                     ],
 //                   ),
@@ -1992,27 +2149,27 @@ class _ChatScreenState extends State<ChatScreen> {
 //         ),
 //         Container(
 //           color: Colors.white,
-//           padding:
-//           const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+//           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
 //           child: Row(children: [
 //             IconButton(
-//               icon: const Icon(Icons.add, color: Colors.green),
-//               onPressed: _showAttachmentMenu
-//               //_pickImage,
+//               icon: const Icon(Icons.attach_file, color: Colors.green),
+//               onPressed: _showAttachmentMenu,
 //             ),
 //             Expanded(
 //               child: TextField(
 //                 controller: _msgCtrl,
-//                 decoration: const InputDecoration(
-//                     hintText: "Message", border: InputBorder.none),
-//                 onChanged: (_) => _typingStart(),
+//                 onChanged: (v) => _typingStart(),
 //                 onEditingComplete: _typingStop,
+//                 decoration: const InputDecoration(
+//                   hintText: "Type a message",
+//                   border: InputBorder.none,
+//                 ),
 //               ),
 //             ),
-//             _sending
-//                 ? const CircularProgressIndicator(strokeWidth: 2)
-//                 : IconButton(
-//               icon: const Icon(Icons.send, color: Colors.green),
+//             IconButton(
+//               icon: _sending
+//                   ? const CircularProgressIndicator()
+//                   : const Icon(Icons.send, color: Colors.green),
 //               onPressed: _sendText,
 //             ),
 //           ]),
@@ -2022,521 +2179,4 @@ class _ChatScreenState extends State<ChatScreen> {
 //   }
 // }
 
-//
-// import 'dart:convert';
-// import 'dart:io';
-// import 'package:flutter/material.dart';
-// import 'package:provider/provider.dart';
-// import 'package:image_picker/image_picker.dart';
-// import 'package:permission_handler/permission_handler.dart';
-// import 'package:mime/mime.dart';
-// import 'package:path/path.dart' as p;
-// import '../providers/telegraph_qg_provider.dart';
-//
-// class ChatScreen extends StatefulWidget {
-//   final String phone;
-//   final int chatId;
-//   final int accessHash;
-//   final String name;
-//   final String username;
-//
-//   const ChatScreen({
-//     super.key,
-//     required this.phone,
-//     required this.chatId,
-//     required this.accessHash,
-//     required this.name,
-//     required this.username,
-//   });
-//
-//   @override
-//   State<ChatScreen> createState() => _ChatScreenState();
-// }
-//
-// class _ChatScreenState extends State<ChatScreen> {
-//   final ScrollController _scrollController = ScrollController();
-//   final TextEditingController _msgCtrl = TextEditingController();
-//   final ImagePicker _picker = ImagePicker();
-//   WebSocket? _socket;
-//
-//   bool _loading = true;
-//   bool _sending = false;
-//   double _uploadProgress = 0.0;
-//   int? _uploadingMsgIndex;
-//
-//   @override
-//   void initState() {
-//     super.initState();
-//     _fetchAndLoad();
-//     _connectWebSocket();
-//   }
-//
-//   @override
-//   void dispose() {
-//     _socket?.close();
-//     super.dispose();
-//   }
-//
-//   // ================================
-//   // WebSocket connect
-//   // ================================
-//   Future<void> _connectWebSocket() async {
-//     try {
-//       final wsUrl = 'ws://192.168.0.247:8080/chat_ws';
-//       _socket = await WebSocket.connect(wsUrl);
-//       debugPrint("✅ WS connected");
-//
-//       final init = {
-//         "phone": widget.phone,
-//         "chat_id": widget.chatId,
-//         "access_hash": widget.accessHash,
-//       };
-//       _socket!.add(jsonEncode(init));
-//
-//       _socket!.listen((raw) async {
-//         if (!mounted) return;
-//         final provider = Provider.of<TelegraphProvider>(context, listen: false);
-//
-//         try {
-//           final data = jsonDecode(raw);
-//
-//           // Typing start/stop
-//           if (data["action"] == "typing") {
-//             provider.setTyping(true);
-//             return;
-//           }
-//           if (data["action"] == "typing_stopped") {
-//             provider.setTyping(false);
-//             return;
-//           }
-//
-//           // Upload progress
-//           if (data["action"] == "upload_progress") {
-//             final prog = (data["progress"] ?? 0).toDouble();
-//             setState(() => _uploadProgress = prog);
-//             if (_uploadingMsgIndex != null &&
-//                 _uploadingMsgIndex! < provider.messages.length) {
-//               provider.messages[_uploadingMsgIndex!]["progress"] = prog;
-//               provider.notifyListeners();
-//             }
-//             return;
-//           }
-//
-//           // New message
-//           if (data["action"] == "new_message") {
-//             final mediaType = data["media_type"] ?? "text";
-//             final isOut = data["is_out"] ?? false;
-//             final fileUrl = data["media_link"];
-//
-//             Map<String, dynamic> msgData = {
-//               "id": data["id"],
-//               "text": data["text"] ?? "",
-//               "is_out": isOut,
-//               "time": data["date"] ?? DateTime.now().toString(),
-//               "type": mediaType,
-//               "url": fileUrl,
-//             };
-//
-//             if (mediaType.startsWith("call")) {
-//               final call = data["call"] ?? {};
-//               msgData.addAll({
-//                 "call": call,
-//                 "call_status": call["status"] ?? "",
-//                 "direction": call["direction"] ?? "incoming",
-//                 "reason": call["reason"] ?? "",
-//                 "duration": call["duration"],
-//               });
-//             }
-//
-//             provider.addMessage(msgData);
-//
-//             // Auto scroll to top (reverse:true)
-//             _scrollController.animateTo(
-//               0,
-//               duration: const Duration(milliseconds: 300),
-//               curve: Curves.easeOut,
-//             );
-//             return;
-//           }
-//
-//           // Sent confirmation
-//           if ((data["status"] ?? "").toString().startsWith("sent_")) {
-//             setState(() => _uploadProgress = 100.0);
-//             if (_uploadingMsgIndex != null &&
-//                 _uploadingMsgIndex! < provider.messages.length) {
-//               provider.messages[_uploadingMsgIndex!]["uploading"] = false;
-//               provider.messages[_uploadingMsgIndex!]["progress"] = 100.0;
-//               provider.notifyListeners();
-//               _uploadingMsgIndex = null;
-//             }
-//             return;
-//           }
-//         } catch (e) {
-//           debugPrint("⚠️ WS decode error: $e");
-//         }
-//       }, onDone: () {
-//         Future.delayed(const Duration(seconds: 3), _connectWebSocket);
-//       }, onError: (err) {
-//         Future.delayed(const Duration(seconds: 5), _connectWebSocket);
-//       });
-//     } catch (e) {
-//       Future.delayed(const Duration(seconds: 5), _connectWebSocket);
-//     }
-//   }
-//
-//   // ================================
-//   // Fetch initial messages
-//   // ================================
-//   Future<void> _fetchAndLoad() async {
-//     final provider = Provider.of<TelegraphProvider>(context, listen: false);
-//     await provider.fetchMessages(widget.phone, widget.chatId, widget.accessHash);
-//     setState(() => _loading = false);
-//   }
-//
-//   // ================================
-//   // Send text
-//   // ================================
-//   Future<void> _sendText() async {
-//     final text = _msgCtrl.text.trim();
-//     if (text.isEmpty) return;
-//
-//     setState(() => _sending = true);
-//     final provider = Provider.of<TelegraphProvider>(context, listen: false);
-//
-//     final payload = {
-//       "action": "send",
-//       "phone": widget.phone,
-//       "chat_id": widget.chatId,
-//       "access_hash": widget.accessHash,
-//       "text": text,
-//     };
-//
-//     try {
-//       _socket?.add(jsonEncode(payload));
-//
-//       provider.addMessage({
-//         "text": text,
-//         "is_out": true,
-//         "time": DateTime.now().toString(),
-//         "type": "text",
-//       });
-//       _msgCtrl.clear();
-//     } catch (e) {
-//       debugPrint("⚠️ send text error: $e");
-//     } finally {
-//       setState(() => _sending = false);
-//     }
-//   }
-//
-//   // ================================
-//   // Send file
-//   // ================================
-//   Future<void> _sendFile(File file) async {
-//     try {
-//       final bytes = await file.readAsBytes();
-//       final b64 = base64Encode(bytes);
-//       final fileName = p.basename(file.path);
-//       final mime = lookupMimeType(file.path) ?? "application/octet-stream";
-//       final isImage = mime.startsWith('image/');
-//
-//       final provider = Provider.of<TelegraphProvider>(context, listen: false);
-//       provider.addMessage({
-//         "text": "",
-//         "is_out": true,
-//         "time": DateTime.now().toString(),
-//         "type": isImage ? "image" : "file",
-//         "local_path": file.path,
-//         "uploading": true,
-//         "progress": 0.0,
-//       });
-//       _uploadingMsgIndex = 0;
-//
-//       final payload = {
-//         "action": "send",
-//         "phone": widget.phone,
-//         "chat_id": widget.chatId,
-//         "access_hash": widget.accessHash,
-//         "file_name": fileName,
-//         "file_base64": b64,
-//         "mime_type": mime,
-//       };
-//
-//       _socket?.add(jsonEncode(payload));
-//     } catch (e) {
-//       debugPrint("⚠️ send file error: $e");
-//     }
-//   }
-//
-//   // ================================
-//   // Typing events
-//   // ================================
-//   void _typingStart() {
-//     final provider = Provider.of<TelegraphProvider>(context, listen: false);
-//     provider.setTyping(true);
-//     if (_socket?.readyState == WebSocket.open) {
-//       _socket!.add(jsonEncode({
-//         "action": "typing_start",
-//         "phone": widget.phone,
-//         "chat_id": widget.chatId
-//       }));
-//     }
-//   }
-//
-//   void _typingStop() {
-//     final provider = Provider.of<TelegraphProvider>(context, listen: false);
-//     provider.setTyping(false);
-//     if (_socket?.readyState == WebSocket.open) {
-//       _socket!.add(jsonEncode({
-//         "action": "typing_stop",
-//         "phone": widget.phone,
-//         "chat_id": widget.chatId
-//       }));
-//     }
-//   }
-//
-//   // ================================
-//   // Pick image/video
-//   // ================================
-//   Future<void> _ensurePerms() async {
-//     await [Permission.camera, Permission.photos, Permission.storage].request();
-//   }
-//
-//   Future<void> _pickImage() async {
-//     await _ensurePerms();
-//     final img = await _picker.pickImage(source: ImageSource.gallery);
-//     if (img != null) await _sendFile(File(img.path));
-//   }
-//
-//   Future<void> _pickVideo() async {
-//     await _ensurePerms();
-//     final vid = await _picker.pickVideo(source: ImageSource.gallery);
-//     if (vid != null) {
-//       await _sendFile(File(vid.path));
-//     }
-//   }
-//
-//   void _showAttachmentMenu() {
-//     showModalBottomSheet(
-//       context: context,
-//       builder: (ctx) => SafeArea(
-//         child: Wrap(children: [
-//           ListTile(
-//             leading: const Icon(Icons.photo, color: Colors.green),
-//             title: const Text("Send Image"),
-//             onTap: () {
-//               Navigator.pop(ctx);
-//               _pickImage();
-//             },
-//           ),
-//           ListTile(
-//             leading: const Icon(Icons.videocam, color: Colors.green),
-//             title: const Text("Send Video"),
-//             onTap: () {
-//               Navigator.pop(ctx);
-//               _pickVideo();
-//             },
-//           ),
-//         ]),
-//       ),
-//     );
-//   }
-//
-//   // ================================
-//   // Bubble builder
-//   // ================================
-//   Widget _bubbleContent(Map<String, dynamic> msg, bool isOut) {
-//     final type = msg["type"] ?? "text";
-//     final text = msg["text"] ?? "";
-//
-//     // Call bubble
-//     if (type.startsWith("call")) {
-//       final call = msg["call"] ?? {};
-//       final status = call["status"] ?? "";
-//       final direction = call["direction"] ?? "incoming";
-//       final reason = call["reason"] ?? "";
-//       final duration = call["duration"];
-//
-//       IconData icon;
-//       Color color;
-//
-//       if (status == "missed") {
-//         icon = Icons.call_missed;
-//         color = Colors.red;
-//       } else if (status == "ended") {
-//         icon = Icons.call_end;
-//         color = Colors.green;
-//       } else if (status == "busy") {
-//         icon = Icons.call_end;
-//         color = Colors.orange;
-//       } else if (status == "canceled") {
-//         icon = Icons.phone_disabled;
-//         color = Colors.grey;
-//       } else {
-//         icon = Icons.phone;
-//         color = Colors.blueGrey;
-//       }
-//
-//       String displayText = "";
-//       if (status == "missed") {
-//         displayText = direction == "incoming"
-//             ? "❌ Missed call"
-//             : "📞 Missed outgoing call";
-//       } else if (status == "ended") {
-//         displayText = direction == "incoming"
-//             ? "📞 Call ended (${duration ?? 0} sec)"
-//             : "📤 Call ended (${duration ?? 0} sec)";
-//       } else if (status == "busy") {
-//         displayText = "📵 User busy";
-//       } else if (status == "canceled") {
-//         displayText = "🚫 Call canceled";
-//       } else {
-//         displayText = "☎️ Call";
-//       }
-//
-//       if (reason.isNotEmpty) displayText += " ($reason)";
-//
-//       return Row(
-//         mainAxisSize: MainAxisSize.min,
-//         children: [
-//           Icon(icon, color: color, size: 20),
-//           const SizedBox(width: 6),
-//           Flexible(
-//             child: Text(
-//               "$displayText (${direction == "incoming" ? "Incoming" : "Outgoing"})",
-//               style: TextStyle(
-//                 color: isOut ? Colors.white : Colors.black87,
-//                 fontWeight: FontWeight.w500,
-//               ),
-//             ),
-//           ),
-//         ],
-//       );
-//     }
-//
-//     // Image bubble
-//     if (type == "image") {
-//       final localPath = msg["local_path"];
-//       final url = msg["url"];
-//       final w = 220.0, h = 260.0;
-//       return ClipRRect(
-//         borderRadius: BorderRadius.circular(10),
-//         child: localPath != null
-//             ? Image.file(File(localPath), width: w, height: h, fit: BoxFit.cover)
-//             : (url != null
-//             ? Image.network(url, width: w, height: h, fit: BoxFit.cover)
-//             : Container(
-//           width: w,
-//           height: h,
-//           color: Colors.grey,
-//           child: const Icon(Icons.image),
-//         )),
-//       );
-//     }
-//
-//     return Text(
-//       text,
-//       style: TextStyle(color: isOut ? Colors.white : Colors.black87, fontSize: 15),
-//     );
-//   }
-//
-//   @override
-//   Widget build(BuildContext context) {
-//     final provider = Provider.of<TelegraphProvider>(context);
-//
-//     return Scaffold(
-//       backgroundColor: const Color(0xFFE5DDD5),
-//       appBar: AppBar(
-//         backgroundColor: const Color(0xFF008069),
-//         title: Row(children: [
-//           const CircleAvatar(
-//               backgroundColor: Colors.white,
-//               child: Icon(Icons.person, color: Colors.black)),
-//           const SizedBox(width: 10),
-//           Text(widget.name,
-//               style: const TextStyle(color: Colors.white, fontSize: 18)),
-//           if (provider.isTyping)
-//             const Padding(
-//               padding: EdgeInsets.only(left: 8),
-//               child: Text("typing...",
-//                   style: TextStyle(color: Colors.white70, fontSize: 12)),
-//             ),
-//         ]),
-//       ),
-//       body: _loading
-//           ? const Center(child: CircularProgressIndicator())
-//           : Column(children: [
-//         Expanded(
-//           child: ListView.builder(
-//             controller: _scrollController,
-//             reverse: true,
-//             itemCount: provider.messages.length,
-//             itemBuilder: (context, i) {
-//               final msg = provider.messages[i];
-//               final isOut = msg["is_out"] == true;
-//               final time = msg["time"] ?? "";
-//
-//               return Align(
-//                 alignment:
-//                 isOut ? Alignment.centerRight : Alignment.centerLeft,
-//                 child: Container(
-//                   margin: const EdgeInsets.symmetric(
-//                       vertical: 6, horizontal: 8),
-//                   padding: const EdgeInsets.all(10),
-//                   decoration: BoxDecoration(
-//                     color: isOut
-//                         ? Colors.green.shade400
-//                         : Colors.grey.shade300,
-//                     borderRadius: BorderRadius.circular(14),
-//                   ),
-//                   child: Column(
-//                     crossAxisAlignment: CrossAxisAlignment.end,
-//                     children: [
-//                       _bubbleContent(msg, isOut),
-//                       Padding(
-//                         padding: const EdgeInsets.only(top: 4),
-//                         child: Text(
-//                           time,
-//                           style: TextStyle(
-//                               color: isOut
-//                                   ? Colors.white70
-//                                   : Colors.grey[700],
-//                               fontSize: 11),
-//                         ),
-//                       ),
-//                     ],
-//                   ),
-//                 ),
-//               );
-//             },
-//           ),
-//         ),
-//         Container(
-//           color: Colors.white,
-//           padding:
-//           const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-//           child: Row(children: [
-//             IconButton(
-//               icon: const Icon(Icons.add, color: Colors.green),
-//               onPressed: _showAttachmentMenu,
-//             ),
-//             Expanded(
-//               child: TextField(
-//                 controller: _msgCtrl,
-//                 decoration: const InputDecoration(
-//                     hintText: "Message", border: InputBorder.none),
-//                 onChanged: (_) => _typingStart(),
-//                 onEditingComplete: _typingStop,
-//               ),
-//             ),
-//             _sending
-//                 ? const CircularProgressIndicator(strokeWidth: 2)
-//                 : IconButton(
-//               icon: const Icon(Icons.send, color: Colors.green),
-//               onPressed: _sendText,
-//             ),
-//           ]),
-//         ),
-//       ]),
-//     );
-//   }
-// }
+

@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:ag_taligram/providers/telegraph_qg_provider.dart';
 import 'package:ag_taligram/screens/auth_screen/phone_login_screen.dart';
 import 'package:ag_taligram/screens/chat_screen.dart';
+import 'package:ag_taligram/screens/search_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -83,6 +84,17 @@ class _TelegraphHomeState extends State<TelegraphHome>
       drawer: TelegraphDrawer(),
       appBar: AppBar(
         title: Text(p.firstName.isNotEmpty ? p.firstName : "Telegraph"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.search, color: Colors.white),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) =>  SearchScreen(phoneNumbar:p.phoneNumber)),
+              );
+            },
+          ),
+        ],
         bottom: TabBar(
           controller: _tabController,
           indicatorColor: Colors.white,

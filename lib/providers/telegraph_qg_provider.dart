@@ -278,43 +278,9 @@ class TelegraphProvider with ChangeNotifier {
       );
     }
   }
-
-  // Future<void> logoutAccount(int index, BuildContext context) async {
-  //   final prefs = await SharedPreferences.getInstance();
-  //   final removed = accounts[index];
-  //   final phone = removed["phone"] ?? "";
-  //
-  //   try {
-  //     final url = Uri.parse("$baseUrl/logout");
-  //     await http.post(url,
-  //         headers: {"Content-Type": "application/json"},
-  //         body: json.encode({"phone": phone}));
-  //   } catch (e) {
-  //     debugPrint("⚠️ Logout API error: $e");
-  //   }
-  //
-  //   accounts.removeAt(index);
-  //   await prefs.setString('accounts', json.encode(accounts));
-  //
-  //   if (accounts.isEmpty) {
-  //     await prefs.clear();
-  //     Navigator.pushNamedAndRemoveUntil(context, '/login', (route) => false);
-  //   } else {
-  //     final next = accounts.first;
-  //     await loadUser({
-  //       "first_name": next["first_name"] ?? "",
-  //       "last_name": next["last_name"] ?? "",
-  //       "username": next["username"] ?? "",
-  //       "phone_number": next["phone"] ?? "",
-  //     });
-  //     Navigator.pop(context);
-  //   }
-  // }
-
   /// chat fach Massage
   ///
   ///
-
   Future<void> fetchMessages(String phone, int chatId, int accessHash) async {
     try {
       final url = Uri.parse(
@@ -328,6 +294,47 @@ class TelegraphProvider with ChangeNotifier {
 
         messages = raw.map<Map<String, dynamic>>((m) {
           final type = m["media_type"] ?? "text";
+          final call = m["call"];
+
+          // Call message
+          if (type.startsWith("call") && call != null) {
+            String callText = "";
+            final dir = call["direction"] ?? "";
+            final status = call["status"] ?? "";
+            final dur = call["duration"];
+            final sec = (dur is num) ? dur.toInt() : null;
+
+            if (status == "missed") {
+              callText = "Missed ${type == "call_video" ? "Video" : "Voice"} Call";
+            } else if (status == "ended") {
+              callText = "Ended ${type == "call_video" ? "Video" : "Voice"} Call";
+            } else {
+              callText = "${type == "call_video" ? "Video" : "Voice"} Call";
+            }
+
+            if (sec != null && sec > 0) {
+              final h = sec ~/ 3600;
+              final m = (sec % 3600) ~/ 60;
+              final s = sec % 60;
+              final durStr = h > 0
+                  ? "${h.toString().padLeft(2,'0')}:${m.toString().padLeft(2,'0')}:${s.toString().padLeft(2,'0')}"
+                  : "${m.toString().padLeft(2,'0')}:${s.toString().padLeft(2,'0')}";
+              callText += " • $durStr";
+            }
+
+            return {
+              "id": m["id"],
+              "text": callText,
+              "is_out": m["is_out"] ?? false,
+              "time": m["date"] ?? "",
+              "type": type, // call_audio / call_video
+              "call_status": status,
+              "call_direction": dir,
+              "sender_name": m["sender_name"] ?? "",
+            };
+          }
+
+          // Normal messages (text / image / video / file)
           return {
             "id": m["id"],
             "text": m["text"] ?? "",
@@ -350,20 +357,28 @@ class TelegraphProvider with ChangeNotifier {
 
   // Future<void> fetchMessages(String phone, int chatId, int accessHash) async {
   //   try {
-  //     final url = Uri.parse("$baseUrl/messages?phone=+$phone&chat_id=$chatId&access_hash=$accessHash");
-  //     print(url);
+  //     final url = Uri.parse(
+  //         "$baseUrl/messages?phone=$phone&chat_id=$chatId&access_hash=$accessHash");
+  //     print("📥 Fetching → $url");
+  //
   //     final res = await http.get(url);
   //     if (res.statusCode == 200) {
   //       final data = json.decode(res.body);
-  //       messages = (data["messages"] ?? [])
-  //           .map<Map<String, dynamic>>((m) => {
-  //         "text": m["text"] ?? "",
-  //         "is_out": m["is_out"] ?? false,
-  //         "time": m["date"] ?? "",
-  //       })
-  //           .toList()
-  //           .reversed
-  //           .toList();
+  //       final List raw = data["messages"] ?? [];
+  //
+  //       messages = raw.map<Map<String, dynamic>>((m) {
+  //         final type = m["media_type"] ?? "text";
+  //         return {
+  //           "id": m["id"],
+  //           "text": m["text"] ?? "",
+  //           "is_out": m["is_out"] ?? false,
+  //           "time": m["date"] ?? "",
+  //           "type": type,
+  //           "url": m["media_link"],
+  //           "sender_name": m["sender_name"] ?? "",
+  //         };
+  //       }).toList().reversed.toList();
+  //
   //       notifyListeners();
   //     } else {
   //       print("❌ Server error: ${res.statusCode}");
