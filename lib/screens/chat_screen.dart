@@ -1497,114 +1497,378 @@ class _ChatScreenState extends State<ChatScreen> {
   // ================================
   // Message Bubble
   // ================================
+
+  //
+  // Widget _bubbleContent(Map<String, dynamic> msg, bool isOut) {
+  //   final type = (msg["type"] ?? "text") as String;
+  //   final text = (msg["text"] ?? "") as String;
+  //   final bool isDeleted = msg["is_deleted"] == true;
+  //
+  //   // 🔴 deleted হলে টেক্সট লাল, না হলে আগের মতো
+  //   final textColor = isDeleted
+  //       ? Colors.red
+  //       : (isOut ? Colors.white : Colors.black87);
+  //
+  //   // 📞 CALL MESSAGE
+  //   if (type == "call") {
+  //     final status = msg["call_status"]?.toString() ?? "";
+  //     final direction = msg["direction"]?.toString() ?? "";
+  //     IconData icon;
+  //     Color color;
+  //
+  //     if (status == "missed") {
+  //       icon = Icons.call_missed;
+  //       color = Colors.red;
+  //     } else if (status == "ended") {
+  //       icon = Icons.call_end;
+  //       color = Colors.green;
+  //     } else if (status == "busy") {
+  //       icon = Icons.call_end;
+  //       color = Colors.orange;
+  //     } else {
+  //       icon = Icons.phone;
+  //       color = Colors.blueGrey;
+  //     }
+  //
+  //     return Row(
+  //       mainAxisSize: MainAxisSize.min,
+  //       children: [
+  //         Icon(icon, color: color, size: 20),
+  //         const SizedBox(width: 6),
+  //         Flexible(
+  //           child: Text(
+  //             "$text (${direction == "incoming" ? "Incoming" : "Outgoing"})",
+  //             style: TextStyle(
+  //               color: textColor,
+  //               fontWeight: FontWeight.w600,
+  //             ),
+  //           ),
+  //         ),
+  //       ],
+  //     );
+  //   }
+  //
+  //   // 🖼️ IMAGE
+  //   if (type == "image") {
+  //     final localPath = msg["local_path"];
+  //     final url = msg["url"];
+  //     const w = 220.0, h = 260.0;
+  //
+  //     Widget imageChild;
+  //     if (localPath != null) {
+  //       imageChild =
+  //           Image.file(File(localPath), width: w, height: h, fit: BoxFit.cover);
+  //     } else if (url != null) {
+  //       imageChild = Image.network(_resolveUrl(url)!,
+  //           width: w, height: h, fit: BoxFit.cover);
+  //     } else {
+  //       imageChild = Container(
+  //         width: w,
+  //         height: h,
+  //         color: Colors.grey,
+  //         child: const Icon(Icons.image),
+  //       );
+  //     }
+  //
+  //     return ClipRRect(
+  //         borderRadius: BorderRadius.circular(10), child: imageChild);
+  //   }
+  //
+  //   // 🎥 VIDEO
+  //   if (type == "video") {
+  //     return Row(
+  //       mainAxisSize: MainAxisSize.min,
+  //       children: [
+  //         const Icon(Icons.videocam),
+  //         const SizedBox(width: 8),
+  //         Text("Video", style: TextStyle(color: textColor)),
+  //       ],
+  //     );
+  //   }
+  //
+  //   // 🎧 AUDIO
+  //   if (type == "audio" || type == "voice") {
+  //     return Row(
+  //       mainAxisSize: MainAxisSize.min,
+  //       children: [
+  //         const Icon(Icons.audiotrack),
+  //         const SizedBox(width: 8),
+  //         Text(
+  //           type == "voice" ? "Voice message" : "Audio",
+  //           style: TextStyle(color: textColor),
+  //         ),
+  //       ],
+  //     );
+  //   }
+  //
+  //   // 📝 Normal Text
+  //   return Text(
+  //     text,
+  //     style: TextStyle(
+  //       color: textColor,
+  //       fontSize: 15,
+  //       fontStyle: isDeleted ? FontStyle.italic : FontStyle.normal,
+  //       fontWeight: isDeleted ? FontWeight.bold : FontWeight.normal,
+  //     ),
+  //   );
+  // }
+
+
+
   Widget _bubbleContent(Map<String, dynamic> msg, bool isOut) {
     final type = (msg["type"] ?? "text") as String;
     final text = (msg["text"] ?? "") as String;
+    final bool isDeleted = msg["is_deleted"] == true;
 
-    if (type == "call") {
+    // 🔴 deleted হলে টেক্সট লাল, না হলে আগের মতো
+    final textColor =
+    isDeleted ? Colors.red : (isOut ? Colors.white : Colors.black87);
+
+    // ==========================================
+    // 📞 CALL MESSAGE
+    // ==========================================
+    if (type == "call" || type == "call_audio" || type == "call_video") {
       final status = msg["call_status"]?.toString() ?? "";
       final direction = msg["direction"]?.toString() ?? "";
+      final bool isVideo = type == "call_video";
+
       IconData icon;
-      Color color;
+      Color iconColor;
+      String label;
 
       if (status == "missed") {
-        icon = Icons.call_missed;
-        color = Colors.red;
+        icon = isVideo ? Icons.videocam_off : Icons.call_missed;
+        iconColor = Colors.redAccent;
+        label = isVideo ? "Missed Video Call" : "Missed Voice Call";
       } else if (status == "ended") {
-        icon = Icons.call_end;
-        color = Colors.green;
+        icon = isVideo ? Icons.videocam : Icons.call_end;
+        iconColor = Colors.green;
+        label = isVideo ? "Video Call Ended" : "Voice Call Ended";
       } else if (status == "busy") {
-        icon = Icons.call_end;
-        color = Colors.orange;
+        icon = isVideo ? Icons.videocam : Icons.call_end;
+        iconColor = Colors.orange;
+        label = isVideo ? "Video Call Busy" : "Voice Call Busy";
       } else {
-        icon = Icons.phone;
-        color = Colors.blueGrey;
+        icon = isVideo ? Icons.videocam : Icons.phone;
+        iconColor = Colors.blueGrey;
+        label = isVideo ? "Video Call" : "Voice Call";
       }
 
+      // 🎨 Make nice row design
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        decoration: BoxDecoration(
+          color: isOut ? Colors.white.withOpacity(0.1) : Colors.black12,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: iconColor, size: 20),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                "$label (${direction == "incoming" ? "Incoming" : "Outgoing"})",
+                style: TextStyle(
+                  color: textColor,
+                  fontWeight: FontWeight.w600,
+                  fontStyle:
+                  isDeleted ? FontStyle.italic : FontStyle.normal,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // ==========================================
+    // 🖼️ IMAGE
+    // ==========================================
+    if (type == "image") {
+      final localPath = msg["local_path"];
+      final url = msg["url"];
+      const w = 220.0, h = 260.0;
+
+      Widget imageChild;
+      if (localPath != null) {
+        imageChild = Image.file(File(localPath),
+            width: w, height: h, fit: BoxFit.cover);
+      } else if (url != null) {
+        imageChild = Image.network(
+          _resolveUrl(url)!,
+          width: w,
+          height: h,
+          fit: BoxFit.cover,
+        );
+      } else {
+        imageChild = Container(
+          width: w,
+          height: h,
+          color: Colors.grey,
+          child: const Icon(Icons.image),
+        );
+      }
+
+      return ClipRRect(
+          borderRadius: BorderRadius.circular(10), child: imageChild);
+    }
+
+    // ==========================================
+    // 🎥 VIDEO
+    // ==========================================
+    if (type == "video") {
       return Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, color: color, size: 20),
-          const SizedBox(width: 6),
-          Flexible(
-            child: Text(
-              "$text (${direction == "incoming" ? "Incoming" : "Outgoing"})",
-              style: TextStyle(
-                color: isOut ? Colors.white : Colors.black87,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
+          const Icon(Icons.videocam, color: Colors.blue),
+          const SizedBox(width: 8),
+          Text("Video", style: TextStyle(color: textColor)),
+        ],
+      );
+    }
+
+    // ==========================================
+    // 🎧 AUDIO
+    // ==========================================
+    if (type == "audio" || type == "voice") {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.audiotrack, color: Colors.orangeAccent),
+          const SizedBox(width: 8),
+          Text(
+            type == "voice" ? "Voice message" : "Audio",
+            style: TextStyle(color: textColor),
           ),
         ],
       );
     }
 
-    if (type == "image") {
-      final localPath = msg["local_path"];
-      final url = msg["url"];
-      const w = 220.0, h = 260.0;
-      final uploading = msg["uploading"] == true;
-      final progress = (msg["progress"] ?? 0.0) as num;
-
-      Widget imageChild;
-      if (localPath != null) {
-        imageChild = Image.file(File(localPath), width: w, height: h, fit: BoxFit.cover);
-      } else if (url != null) {
-        imageChild = Image.network(_resolveUrl(url)!, width: w, height: h, fit: BoxFit.cover);
-      } else {
-        imageChild = Container(width: w, height: h, color: Colors.grey, child: const Icon(Icons.image));
-      }
-
-      return Stack(
-        children: [
-          ClipRRect(borderRadius: BorderRadius.circular(10), child: imageChild),
-          if (uploading)
-            Positioned.fill(
-              child: Container(
-                alignment: Alignment.bottomCenter,
-                decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.all(8.0),
-                  child: LinearProgressIndicator(
-                    value: progress.clamp(0, 100) / 100.0,
-                    minHeight: 5,
-                  ),
-                ),
-              ),
-            ),
-        ],
-      );
-    }
-
-    if (type == "video") {
-      return Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.videocam),
-          const SizedBox(width: 8),
-          Text("Video", style: TextStyle(color: isOut ? Colors.white : Colors.black87)),
-        ],
-      );
-    }
-
-    if (type == "audio" || type == "voice") {
-      return Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.audiotrack),
-          const SizedBox(width: 8),
-          Text(type == "voice" ? "Voice message" : "Audio",
-              style: TextStyle(color: isOut ? Colors.white : Colors.black87)),
-        ],
-      );
-    }
-
-    // text / file / sticker (basic)
-    return Text(text, style: TextStyle(color: isOut ? Colors.white : Colors.black87, fontSize: 15));
+    // ==========================================
+    // 📝 Normal Text
+    // ==========================================
+    return Text(
+      text,
+      style: TextStyle(
+        color: textColor,
+        fontSize: 15,
+        fontStyle: isDeleted ? FontStyle.italic : FontStyle.normal,
+        fontWeight: isDeleted ? FontWeight.bold : FontWeight.normal,
+      ),
+    );
   }
+
+
+
+  // Widget _bubbleContent(Map<String, dynamic> msg, bool isOut) {
+  //   final type = (msg["type"] ?? "text") as String;
+  //   final text = (msg["text"] ?? "") as String;
+  //
+  //   if (type == "call") {
+  //     final status = msg["call_status"]?.toString() ?? "";
+  //     final direction = msg["direction"]?.toString() ?? "";
+  //     IconData icon;
+  //     Color color;
+  //
+  //     if (status == "missed") {
+  //       icon = Icons.call_missed;
+  //       color = Colors.red;
+  //     } else if (status == "ended") {
+  //       icon = Icons.call_end;
+  //       color = Colors.green;
+  //     } else if (status == "busy") {
+  //       icon = Icons.call_end;
+  //       color = Colors.orange;
+  //     } else {
+  //       icon = Icons.phone;
+  //       color = Colors.blueGrey;
+  //     }
+  //
+  //     return Row(
+  //       mainAxisSize: MainAxisSize.min,
+  //       children: [
+  //         Icon(icon, color: color, size: 20),
+  //         const SizedBox(width: 6),
+  //         Flexible(
+  //           child: Text(
+  //             "$text (${direction == "incoming" ? "Incoming" : "Outgoing"})",
+  //             style: TextStyle(
+  //               color: isOut ? Colors.white : Colors.black87,
+  //               fontWeight: FontWeight.w600,
+  //             ),
+  //           ),
+  //         ),
+  //       ],
+  //     );
+  //   }
+  //
+  //   if (type == "image") {
+  //     final localPath = msg["local_path"];
+  //     final url = msg["url"];
+  //     const w = 220.0, h = 260.0;
+  //     final uploading = msg["uploading"] == true;
+  //     final progress = (msg["progress"] ?? 0.0) as num;
+  //
+  //     Widget imageChild;
+  //     if (localPath != null) {
+  //       imageChild = Image.file(File(localPath), width: w, height: h, fit: BoxFit.cover);
+  //     } else if (url != null) {
+  //       imageChild = Image.network(_resolveUrl(url)!, width: w, height: h, fit: BoxFit.cover);
+  //     } else {
+  //       imageChild = Container(width: w, height: h, color: Colors.grey, child: const Icon(Icons.image));
+  //     }
+  //
+  //     return Stack(
+  //       children: [
+  //         ClipRRect(borderRadius: BorderRadius.circular(10), child: imageChild),
+  //         if (uploading)
+  //           Positioned.fill(
+  //             child: Container(
+  //               alignment: Alignment.bottomCenter,
+  //               decoration: BoxDecoration(
+  //                 color: Colors.black.withOpacity(0.1),
+  //                 borderRadius: BorderRadius.circular(10),
+  //               ),
+  //               child: Padding(
+  //                 padding: const EdgeInsets.all(8.0),
+  //                 child: LinearProgressIndicator(
+  //                   value: progress.clamp(0, 100) / 100.0,
+  //                   minHeight: 5,
+  //                 ),
+  //               ),
+  //             ),
+  //           ),
+  //       ],
+  //     );
+  //   }
+  //
+  //   if (type == "video") {
+  //     return Row(
+  //       mainAxisSize: MainAxisSize.min,
+  //       children: [
+  //         const Icon(Icons.videocam),
+  //         const SizedBox(width: 8),
+  //         Text("Video", style: TextStyle(color: isOut ? Colors.white : Colors.black87)),
+  //       ],
+  //     );
+  //   }
+  //
+  //   if (type == "audio" || type == "voice") {
+  //     return Row(
+  //       mainAxisSize: MainAxisSize.min,
+  //       children: [
+  //         const Icon(Icons.audiotrack),
+  //         const SizedBox(width: 8),
+  //         Text(type == "voice" ? "Voice message" : "Audio",
+  //             style: TextStyle(color: isOut ? Colors.white : Colors.black87)),
+  //       ],
+  //     );
+  //   }
+  //
+  //   // text / file / sticker (basic)
+  //   return Text(text, style: TextStyle(color: isOut ? Colors.white : Colors.black87, fontSize: 15));
+  // }
 
   // ================================
   // UI

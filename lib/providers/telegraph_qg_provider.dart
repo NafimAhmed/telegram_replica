@@ -281,6 +281,8 @@ class TelegraphProvider with ChangeNotifier {
   /// chat fach Massage
   ///
   ///
+  ///
+  ///
   Future<void> fetchMessages(String phone, int chatId, int accessHash) async {
     try {
       final url = Uri.parse(
@@ -296,7 +298,11 @@ class TelegraphProvider with ChangeNotifier {
           final type = m["media_type"] ?? "text";
           final call = m["call"];
 
-          // Call message
+          // ✅ detect deleted messages
+          final bool isDeleted = (m["exists_on_telegram"] == false) ||
+              (m["deleted_on_telegram"] == true);
+
+          // ☎️ handle call messages
           if (type.startsWith("call") && call != null) {
             String callText = "";
             final dir = call["direction"] ?? "";
@@ -305,11 +311,14 @@ class TelegraphProvider with ChangeNotifier {
             final sec = (dur is num) ? dur.toInt() : null;
 
             if (status == "missed") {
-              callText = "Missed ${type == "call_video" ? "Video" : "Voice"} Call";
+              callText =
+              "Missed ${type == "call_video" ? "Video" : "Voice"} Call";
             } else if (status == "ended") {
-              callText = "Ended ${type == "call_video" ? "Video" : "Voice"} Call";
+              callText =
+              "Ended ${type == "call_video" ? "Video" : "Voice"} Call";
             } else {
-              callText = "${type == "call_video" ? "Video" : "Voice"} Call";
+              callText =
+              "${type == "call_video" ? "Video" : "Voice"} Call";
             }
 
             if (sec != null && sec > 0) {
@@ -317,8 +326,8 @@ class TelegraphProvider with ChangeNotifier {
               final m = (sec % 3600) ~/ 60;
               final s = sec % 60;
               final durStr = h > 0
-                  ? "${h.toString().padLeft(2,'0')}:${m.toString().padLeft(2,'0')}:${s.toString().padLeft(2,'0')}"
-                  : "${m.toString().padLeft(2,'0')}:${s.toString().padLeft(2,'0')}";
+                  ? "${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}"
+                  : "${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}";
               callText += " • $durStr";
             }
 
@@ -327,14 +336,15 @@ class TelegraphProvider with ChangeNotifier {
               "text": callText,
               "is_out": m["is_out"] ?? false,
               "time": m["date"] ?? "",
-              "type": type, // call_audio / call_video
+              "type": type,
               "call_status": status,
               "call_direction": dir,
               "sender_name": m["sender_name"] ?? "",
+              "is_deleted": isDeleted,
             };
           }
 
-          // Normal messages (text / image / video / file)
+          // 🧱 Normal message
           return {
             "id": m["id"],
             "text": m["text"] ?? "",
@@ -343,6 +353,7 @@ class TelegraphProvider with ChangeNotifier {
             "type": type,
             "url": m["media_link"],
             "sender_name": m["sender_name"] ?? "",
+            "is_deleted": isDeleted,
           };
         }).toList().reversed.toList();
 
@@ -354,6 +365,7 @@ class TelegraphProvider with ChangeNotifier {
       print("❌ Fetch messages error: $e");
     }
   }
+
 
   // Future<void> fetchMessages(String phone, int chatId, int accessHash) async {
   //   try {
@@ -368,6 +380,47 @@ class TelegraphProvider with ChangeNotifier {
   //
   //       messages = raw.map<Map<String, dynamic>>((m) {
   //         final type = m["media_type"] ?? "text";
+  //         final call = m["call"];
+  //
+  //         // Call message
+  //         if (type.startsWith("call") && call != null) {
+  //           String callText = "";
+  //           final dir = call["direction"] ?? "";
+  //           final status = call["status"] ?? "";
+  //           final dur = call["duration"];
+  //           final sec = (dur is num) ? dur.toInt() : null;
+  //
+  //           if (status == "missed") {
+  //             callText = "Missed ${type == "call_video" ? "Video" : "Voice"} Call";
+  //           } else if (status == "ended") {
+  //             callText = "Ended ${type == "call_video" ? "Video" : "Voice"} Call";
+  //           } else {
+  //             callText = "${type == "call_video" ? "Video" : "Voice"} Call";
+  //           }
+  //
+  //           if (sec != null && sec > 0) {
+  //             final h = sec ~/ 3600;
+  //             final m = (sec % 3600) ~/ 60;
+  //             final s = sec % 60;
+  //             final durStr = h > 0
+  //                 ? "${h.toString().padLeft(2,'0')}:${m.toString().padLeft(2,'0')}:${s.toString().padLeft(2,'0')}"
+  //                 : "${m.toString().padLeft(2,'0')}:${s.toString().padLeft(2,'0')}";
+  //             callText += " • $durStr";
+  //           }
+  //
+  //           return {
+  //             "id": m["id"],
+  //             "text": callText,
+  //             "is_out": m["is_out"] ?? false,
+  //             "time": m["date"] ?? "",
+  //             "type": type, // call_audio / call_video
+  //             "call_status": status,
+  //             "call_direction": dir,
+  //             "sender_name": m["sender_name"] ?? "",
+  //           };
+  //         }
+  //
+  //         // Normal messages (text / image / video / file)
   //         return {
   //           "id": m["id"],
   //           "text": m["text"] ?? "",
@@ -387,6 +440,8 @@ class TelegraphProvider with ChangeNotifier {
   //     print("❌ Fetch messages error: $e");
   //   }
   // }
+
+
 
   Future<void> sendMessage(String phone, String to, String text) async {
     try {
