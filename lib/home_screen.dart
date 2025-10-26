@@ -3,6 +3,7 @@
 import 'dart:convert';
 import 'package:ag_taligram/providers/telegraph_qg_provider.dart';
 import 'package:ag_taligram/screens/auth_screen/phone_login_screen.dart';
+import 'package:ag_taligram/screens/chant.dart';
 import 'package:ag_taligram/screens/chat_screen.dart';
 import 'package:ag_taligram/screens/search_screen.dart';
 import 'package:flutter/material.dart';

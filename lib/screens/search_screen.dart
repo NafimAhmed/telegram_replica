@@ -216,6 +216,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../url.dart';
+import 'chant.dart';
 import 'chat_screen.dart';
 
 class SearchScreen extends StatefulWidget {

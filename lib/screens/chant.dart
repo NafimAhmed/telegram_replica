@@ -1,20 +1,21 @@
+//
+//
 // import 'dart:async';
 // import 'dart:convert';
 // import 'dart:io';
 // import 'dart:math';
+//
 // import 'package:flutter/material.dart';
-// import 'package:flutter/services.dart';
 // import 'package:image_picker/image_picker.dart';
 // import 'package:mime/mime.dart';
-// import 'package:path/path.dart' as p;
-// import 'package:permission_handler/permission_handler.dart';
-// import 'package:provider/provider.dart';
-// import '../providers/telegraph_qg_provider.dart';
+// import 'package:url_launcher/url_launcher.dart';
 //
-// class ChatScreen extends StatefulWidget {
+// import '../url.dart';
+//
+// class ChatScreen extends StatefulWidget {// e.g., http://192.168.0.247:8080 or https://api.example.com
 //   final String phone;
 //   final int chatId;
-//   final int accessHash;
+//   final int? accessHash; // optional
 //   final String name;
 //   final String username;
 //
@@ -32,933 +33,1854 @@
 // }
 //
 // class _ChatScreenState extends State<ChatScreen> {
-//   // ==== CONFIG ====
-//   static const String _wsUrl = 'ws://192.168.0.247:8080/chat_ws';
-//   static const String _apiBase = 'http://192.168.0.247:8080'; // <- change if needed
-//   static const Duration _wsPingEvery = Duration(seconds: 22);
-//
-//   final ScrollController _scrollController = ScrollController();
-//   final TextEditingController _msgCtrl = TextEditingController();
-//   final ImagePicker _picker = ImagePicker();
-//   WebSocket? _socket;
-//
-//   bool _loading = true;
-//   bool _sending = false;
-//   bool _typing = false;
-//
-//   // Seed tracker so UI loads even before sending
-//   bool _gotSeed = false;
-//
-//   // Reply-to
-//   int? _replyToMsgId;
-//   Map<String, dynamic>? _replyToMsgMap;
-//
-//   // WS helpers
-//   Timer? _pingTimer;
-//   Timer? _reconnectTimer;
-//   Timer? _typingDebounce;
+//   // WebSocket
+//   WebSocket? _ws;
+//   bool _connecting = false;
+//   bool _manuallyClosed = false;
 //   int _reconnectAttempt = 0;
-//   final Set<String> _seenIds = {}; // for de-dupe (server IDs or temp ids)
-//   final String _clientInstance = DateTime.now().millisecondsSinceEpoch.toString();
 //
-//   // Track temp_id → list index for progress & finalize
-//   final Map<String, int> _tempIndex = {};
+//   // Heartbeat / typing
+//   Timer? _pingTimer;
+//   Timer? _typingDebounce;
+//   final Set<int> _typingUserIds = <int>{};
+//   Timer? _typingTtlSweeper;
+//   final Map<int, DateTime> _typingTtl = {}; // senderId -> expiry
+//
+//   // UI
+//   final TextEditingController _textCtrl = TextEditingController();
+//   final ScrollController _scrollCtrl = ScrollController();
+//   bool _seedArrived = false;
+//   bool _listening = false;
+//   bool _sending = false;
+//
+//   // Reply context
+//   int? _replyToMsgId;
+//   String? _replyPreviewText;
+//
+//   // Messages (oldest → newest)
+//   final List<ChatMessage> _messages = [];
+//   final Map<int, ChatMessage> _byId = {};
+//   final Map<String, ChatMessage> _byTemp = {};
+//
+//   // Helpers
+//   String get _wsUrl {
+//     final base = urlLocal.trim();
+//     final uri = Uri.parse(base);
+//     final isHttps = uri.scheme == 'https';
+//     final scheme = isHttps ? 'wss' : 'ws';
+//     final path = uri.path.endsWith('/') ? '${uri.path}chat_ws' : '${uri.path}/chat_ws';
+//     final wsUri = Uri(scheme: scheme, host: uri.host, port: uri.hasPort ? uri.port : null, path: path);
+//     return wsUri.toString();
+//   }
+//
+//   String rewriteMediaLink(String? link) {
+//     if (link == null || link.isEmpty) return '';
+//     final api = Uri.parse(urlLocal);
+//     Uri uri;
+//     try { uri = Uri.parse(link); } catch (_) { return link; }
+//
+//     final isLocal = (uri.host == '127.0.0.1') || (uri.host == 'localhost');
+//     if (!isLocal) return link; // already absolute external
+//
+//     // Rewrite to apiBase host/scheme/port, preserve path+query
+//     final newUri = Uri(
+//       scheme: api.scheme,
+//       host: api.host,
+//       port: api.hasPort ? api.port : null,
+//       path: uri.path,
+//       query: uri.query,
+//     );
+//     return newUri.toString();
+//   }
 //
 //   @override
 //   void initState() {
 //     super.initState();
-//     // প্রথমে WS connect করি, যাতে INIT → seed/new_message তাড়াতাড়ি আসে
-//     _connectWebSocket();
-//
-//     // যদি ১.২ সেকেন্ডে seed না আসে, REST দিয়ে ব্যাকফিল করি
-//     Future.delayed(const Duration(milliseconds: 1200), () {
-//       if (mounted && !_gotSeed) {
-//         _fetchAndLoad();
-//       }
-//     });
+//     _connect();
 //   }
 //
 //   @override
 //   void dispose() {
+//     _manuallyClosed = true;
 //     _pingTimer?.cancel();
-//     _reconnectTimer?.cancel();
 //     _typingDebounce?.cancel();
-//     _socket?.close();
-//     _scrollController.dispose();
-//     _msgCtrl.dispose();
+//     _typingTtlSweeper?.cancel();
+//     _ws?.close();
+//     _textCtrl.dispose();
+//     _scrollCtrl.dispose();
 //     super.dispose();
 //   }
 //
-//   // ================================
-//   // 🔌 WebSocket Connect (self-healing)
-//   // ================================
-//   Future<void> _connectWebSocket() async {
+//   Future<void> _connect() async {
+//     if (_connecting) return;
+//     _connecting = true;
+//     _manuallyClosed = false;
+//
 //     try {
-//       _reconnectTimer?.cancel();
-//       _socket = await WebSocket.connect(_wsUrl);
+//       setState(() { _listening = false; });
+//       _ws = await WebSocket.connect(_wsUrl);
 //       _reconnectAttempt = 0;
-//       debugPrint("✅ WS Connected");
 //
-//       // Init frame (server expects this as first message)
-//       _socket!.add(jsonEncode({
-//         "phone": widget.phone,
-//         "chat_id": widget.chatId,
-//         "access_hash": widget.accessHash,
-//       }));
-//       // INIT-এর পর সাথে সাথে একটা ping — কিছু proxy/servers তাতে ইভেন্ট ফ্লাশ করে দেয়
-//       _socket!.add(jsonEncode({"action": "ping"}));
+//       // Send INIT as first frame
+//       final initPayload = {
+//         'phone': widget.phone,
+//         'chat_id': widget.chatId,
+//         if (widget.accessHash != null) 'access_hash': widget.accessHash,
+//       };
+//       _send(initPayload);
 //
-//       // Start server ping (keep-alive)
-//       _pingTimer?.cancel();
-//       _pingTimer = Timer.periodic(_wsPingEvery, (_) {
-//         if (_socket?.readyState == WebSocket.open) {
-//           _socket!.add(jsonEncode({"action": "ping"}));
-//         }
-//       });
+//       _startPing();
+//       _startTypingSweeper();
 //
-//       _socket!.listen(
-//             (raw) => _handleWsFrame(raw),
-//         onDone: _scheduleReconnect,
-//         onError: (err) {
-//           debugPrint("⚠️ WS error: $err");
-//           _scheduleReconnect();
+//       _ws!.listen(
+//             (dynamic data) {
+//           if (data is String) {
+//             _handleFrameString(data);
+//           } else if (data is List<int>) {
+//             // Most servers send text frames; handle just in case
+//             _handleFrameString(utf8.decode(data));
+//           }
 //         },
 //         cancelOnError: true,
+//         onDone: _onSocketDone,
+//         onError: (err) {
+//           _onSocketDone();
+//         },
 //       );
 //     } catch (e) {
-//       debugPrint("⚠️ WS connect failed: $e");
+//       _scheduleReconnect();
+//     } finally {
+//       _connecting = false;
+//     }
+//   }
+//
+//   void _onSocketDone() {
+//     _pingTimer?.cancel();
+//     _typingTtlSweeper?.cancel();
+//     if (!_manuallyClosed) {
 //       _scheduleReconnect();
 //     }
 //   }
 //
-//   void _scheduleReconnect([_]) {
-//     _pingTimer?.cancel();
+//   void _scheduleReconnect() {
+//     if (_manuallyClosed) return;
 //     _reconnectAttempt++;
-//     final delay = Duration(seconds: _reconnectBackoffSeconds(_reconnectAttempt));
-//     debugPrint("↩️ Reconnect in ${delay.inSeconds}s (attempt $_reconnectAttempt)");
-//     _reconnectTimer?.cancel();
-//     _reconnectTimer = Timer(delay, _connectWebSocket);
+//     final delay = min(30, pow(2, _reconnectAttempt).toInt()); // 2,4,8,16,30
+//     Future.delayed(Duration(seconds: delay), () {
+//       if (mounted && !_manuallyClosed) _connect();
+//     });
 //   }
 //
-//   int _reconnectBackoffSeconds(int n) {
-//     final v = 1 << (n.clamp(0, 5)); // 1,2,4,8,16,32
-//     return v > 30 ? 30 : v;
+//   void _startPing() {
+//     _pingTimer?.cancel();
+//     _pingTimer = Timer.periodic(const Duration(seconds: 25), (_) {
+//       _send({ 'action': 'ping' });
+//     });
 //   }
 //
-//   // ================================
-//   // 📨 Handle WS frames
-//   // ================================
-//   void _handleWsFrame(String raw) {
-//     if (!mounted) return;
-//     final provider = Provider.of<TelegraphProvider>(context, listen: false);
-//
-//     try {
-//       final data = jsonDecode(raw);
-//
-//       // Heartbeat or pong
-//       if (data["action"] == "_hb" || data["status"] == "pong") return;
-//
-//       // Server errors
-//       if (data["status"] == "error") {
-//         final detail = (data["detail"] ?? "unknown error").toString();
-//         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Server error: $detail")));
-//         return;
+//   void _startTypingSweeper() {
+//     _typingTtlSweeper?.cancel();
+//     _typingTtlSweeper = Timer.periodic(const Duration(seconds: 2), (_) {
+//       final now = DateTime.now().toUtc();
+//       final expired = _typingTtl.entries.where((e) => e.value.isBefore(now)).map((e) => e.key).toList();
+//       if (expired.isNotEmpty) {
+//         for (final id in expired) {
+//           _typingTtl.remove(id);
+//           _typingUserIds.remove(id);
+//         }
+//         if (mounted) setState(() {});
 //       }
+//     });
+//   }
 //
-//       // Listener ack → UI আনব্লক
-//       if (data["status"] == "listening") {
-//         if (mounted && _loading) setState(() => _loading = false);
-//         return;
-//       }
+//   void _handleFrameString(String s) {
+//     Map<String, dynamic> m;
+//     try { m = json.decode(s) as Map<String, dynamic>; } catch (_) { return; }
 //
-//       // Typing events
-//       if (data["action"] == "typing") {
-//         setState(() => _typing = true);
-//         return;
+//     // Status frames
+//     if (m['status'] == 'listening') {
+//       setState(() { _listening = true; });
+//       return;
+//     }
+//     if (m['status'] == 'pong') return;
+//     if (m['status'] == 'error') {
+//       final detail = m['detail']?.toString() ?? 'error';
+//       _showSnack('Error: $detail');
+//       if (detail.contains('not authorized')) {
+//         // No auto-reconnect loop here; user must login separately.
 //       }
-//       if (data["action"] == "typing_stopped") {
-//         setState(() => _typing = false);
-//         return;
-//       }
+//       return;
+//     }
 //
-//       // send_queued: get temp_id and bind to newest pending bubble if needed
-//       if (data["action"] == "send_queued") {
-//         final tempId = data["temp_id"]?.toString();
+//     final action = m['action'];
+//     switch (action) {
+//       case 'seed':
+//         final arr = (m['messages'] as List?) ?? [];
+//         for (final it in arr) {
+//           final msg = ChatMessage.fromJson(it as Map<String, dynamic>);
+//           _insertOrUpdate(msg);
+//         }
+//         _seedArrived = true;
+//         _scrollToBottom();
+//         setState(() {});
+//         break;
+//       case 'new_message':
+//         final msg = ChatMessage.fromJson(m);
+//         _insertOrUpdate(msg);
+//         _scrollAfterIncoming();
+//         setState(() {});
+//         break;
+//       case 'send_queued':
+//         final tempId = m['temp_id']?.toString() ?? _makeTempId();
+//         final msg = ChatMessage(
+//           id: null,
+//           tempId: tempId,
+//           text: (m['text'] ?? '').toString(),
+//           date: _parseIso(m['date']) ?? DateTime.now().toUtc(),
+//           isOut: true,
+//           senderId: null,
+//           senderName: widget.username,
+//           replyTo: null,
+//           mediaType: (m['media_type'] ?? 'text').toString(),
+//           mediaLink: null,
+//           call: null,
+//           deletedOnTelegram: false,
+//           existsOnTelegram: false,
+//           uploadProgress: 0.0,
+//           status: MessageStatus.pending,
+//         );
+//         _messages.add(msg);
+//         _byTemp[tempId] = msg;
+//         _scrollToBottom();
+//         setState(() {});
+//         break;
+//       case 'upload_progress':
+//         final tempId = m['temp_id']?.toString();
+//         final p = (m['progress'] is num) ? (m['progress'] as num).toDouble() : null;
+//         if (tempId != null && p != null) {
+//           final item = _byTemp[tempId];
+//           if (item != null) {
+//             item.uploadProgress = p;
+//             setState(() {});
+//           }
+//         }
+//         break;
+//       case 'send_done':
+//         final tempId = m['temp_id']?.toString();
+//         final msgId = m['msg_id'];
+//         if (tempId != null && msgId is int) {
+//           final item = _byTemp[tempId];
+//           if (item != null) {
+//             item.id = msgId;
+//             item.existsOnTelegram = true;
+//             item.status = MessageStatus.sent;
+//             _byId[msgId] = item;
+//             setState(() {});
+//           }
+//         }
+//         break;
+//       case 'send_failed':
+//         final tempId = m['temp_id']?.toString();
 //         if (tempId != null) {
-//           // find first pending (top of list) and attach temp_id
-//           final idx = provider.messages.indexWhere(
-//                 (m) => (m["pending"] == true) && (m["is_out"] == true) && (m["temp_id"] == null),
-//           );
-//           if (idx != -1) {
-//             provider.messages[idx]["temp_id"] = tempId;
-//             _tempIndex[tempId] = idx;
-//             provider.notifyListeners();
+//           final item = _byTemp[tempId];
+//           if (item != null) {
+//             item.status = MessageStatus.failed;
+//             setState(() {});
+//             _showSnack('Send failed: ${m['detail'] ?? ''}');
 //           }
 //         }
-//         return;
-//       }
-//
-//       // Upload progress for a specific temp_id
-//       if (data["action"] == "upload_progress") {
-//         final tempId = data["temp_id"]?.toString();
-//         final prog = (data["progress"] is num) ? (data["progress"] as num).toDouble() : 0.0;
-//         if (tempId != null && _tempIndex.containsKey(tempId)) {
-//           final idx = _tempIndex[tempId]!;
-//           if (idx >= 0 && idx < provider.messages.length) {
-//             provider.messages[idx]["uploading"] = true;
-//             provider.messages[idx]["progress"] = prog;
-//             provider.notifyListeners();
-//           }
+//         break;
+//       case 'typing':
+//         final sender = (m['sender_id'] is int) ? m['sender_id'] as int : null;
+//         if (sender != null) {
+//           _typingUserIds.add(sender);
+//           _typingTtl[sender] = DateTime.now().toUtc().add(const Duration(seconds: 6));
+//           setState(() {});
 //         }
-//         return;
-//       }
-//
-//       // Final confirmation
-//       if (data["action"] == "send_done") {
-//         final tempId = data["temp_id"]?.toString();
-//         final msgId = data["msg_id"];
-//         final date = (data["date"] ?? DateTime.now().toIso8601String()).toString();
-//         if (tempId != null && _tempIndex.containsKey(tempId)) {
-//           final idx = _tempIndex[tempId]!;
-//           if (idx >= 0 && idx < provider.messages.length) {
-//             provider.messages[idx]["id"] = msgId?.toString() ?? provider.messages[idx]["id"];
-//             provider.messages[idx]["pending"] = false;
-//             provider.messages[idx]["uploading"] = false;
-//             provider.messages[idx]["progress"] = 100.0;
-//             provider.messages[idx]["time"] = date;
-//             provider.notifyListeners();
-//           }
-//           if (msgId != null) _seenIds.add(msgId.toString());
-//           _tempIndex.remove(tempId);
+//         break;
+//       case 'typing_stopped':
+//         final sender = (m['sender_id'] is int) ? m['sender_id'] as int : null;
+//         if (sender != null) {
+//           _typingUserIds.remove(sender);
+//           _typingTtl.remove(sender);
+//           setState(() {});
 //         }
-//         // echoed new_message আসবে—de-dupe করব
-//         return;
-//       }
-//
-//       // Send failed
-//       if (data["action"] == "send_failed") {
-//         final tempId = data["temp_id"]?.toString();
-//         if (tempId != null && _tempIndex.containsKey(tempId)) {
-//           final idx = _tempIndex[tempId]!;
-//           if (idx >= 0 && idx < provider.messages.length) {
-//             provider.messages[idx]["pending"] = false;
-//             provider.messages[idx]["uploading"] = false;
-//             provider.messages[idx]["progress"] = 0.0;
-//             provider.messages[idx]["text"] = "${provider.messages[idx]["text"] ?? ""} (failed)";
-//             provider.notifyListeners();
-//           }
-//         }
-//         return;
-//       }
-//
-//       // SEED: initial messages pushed by server
-//       if (data["action"] == "seed" && data["messages"] is List) {
-//         _gotSeed = true;
-//         if (mounted && _loading) setState(() => _loading = false);
-//
-//         final List<dynamic> arr = data["messages"];
-//         // server sends newest-last. Our ListView reverse:true (newest top),
-//         // so add from last→first to keep newest at index 0.
-//         for (int i = arr.length - 1; i >= 0; i--) {
-//           final mapped = _mapServerMessage(arr[i]);
-//           if (mapped == null) continue;
-//           final id = mapped["id"]?.toString();
-//           if (id != null && _seenIds.contains(id)) continue;
-//           if (id != null) _seenIds.add(id);
-//           provider.messages.insert(0, mapped);
-//         }
-//         provider.notifyListeners();
-//         return;
-//       }
-//
-//       // PRIMARY MESSAGE (new_message OR generic with id)
-//       if (data["action"] == "new_message" || data.containsKey("id")) {
-//         if (mounted && _loading) setState(() => _loading = false);
-//
-//         final mapped = _mapServerMessage(data);
-//         if (mapped == null) return;
-//
-//         final id = mapped["id"]?.toString();
-//         if (id != null && _seenIds.contains(id)) return; // de-dupe
-//         if (id != null) _seenIds.add(id);
-//
-//         // If it's our own outgoing echo, try to merge with pending by text match fallback:
-//         final isOut = mapped["is_out"] == true;
-//         if (isOut && mapped["type"] == "text") {
-//           final idx = provider.messages.indexWhere((m) {
-//             final bool pending = (m["pending"] == true) && (m["is_out"] == true);
-//             final sameText = (m["text"] ?? "") == (mapped["text"] ?? "");
-//             return pending && sameText;
-//           });
-//           if (idx != -1) {
-//             provider.messages[idx] = mapped;
-//             provider.notifyListeners();
-//             return;
-//           }
-//         }
-//
-//         // Normal insert
-//         provider.messages.insert(0, mapped);
-//         provider.notifyListeners();
-//         return;
-//       }
-//
-//       // (Older path) Explicit call_event
-//       if (data["action"] == "call_event") {
-//         final mapped = _mapCallEvent(data);
-//         if (mapped == null) return;
-//         final id = mapped["id"]?.toString();
-//         if (id != null && _seenIds.contains(id)) return;
-//         if (id != null) _seenIds.add(id);
-//         provider.messages.insert(0, mapped);
-//         provider.notifyListeners();
-//         return;
-//       }
-//     } catch (e) {
-//       debugPrint("⚠️ WS parse error: $e");
+//         break;
+//       case '_hb':
+//       // server heartbeat; ignore
+//         break;
+//       default:
+//       // ignore
 //     }
 //   }
 //
-//   // ================================
-//   // 📨 Load messages (initial REST, optional fallback)
-//   // ================================
-//   Future<void> _fetchAndLoad() async {
-//     final provider = Provider.of<TelegraphProvider>(context, listen: false);
-//     try {
-//       await provider.fetchMessages(widget.phone, widget.chatId, widget.accessHash);
-//     } catch (_) {
-//       // optional
-//     } finally {
-//       if (mounted) setState(() => _loading = false);
+//   void _insertOrUpdate(ChatMessage msg) {
+//     // Rewrite media link if local
+//     msg.mediaLink = rewriteMediaLink(msg.mediaLink);
+//
+//     if (msg.id != null) {
+//       final existing = _byId[msg.id!];
+//       if (existing != null) {
+//         existing.mergeFrom(msg);
+//       } else {
+//         _byId[msg.id!] = msg;
+//         _messages.add(msg);
+//       }
+//     } else if (msg.tempId != null) {
+//       final existing = _byTemp[msg.tempId!];
+//       if (existing != null) {
+//         existing.mergeFrom(msg);
+//       } else {
+//         _byTemp[msg.tempId!] = msg;
+//         _messages.add(msg);
+//       }
+//     } else {
+//       _messages.add(msg);
 //     }
+//     _messages.sort((a, b) => a.date.compareTo(b.date));
 //   }
 //
-//   // ================================
-//   // ✉️ Send text
-//   // ================================
+//   void _scrollToBottom() {
+//     WidgetsBinding.instance.addPostFrameCallback((_) {
+//       if (!_scrollCtrl.hasClients) return;
+//       _scrollCtrl.animateTo(
+//         _scrollCtrl.position.maxScrollExtent + 80,
+//         duration: const Duration(milliseconds: 250),
+//         curve: Curves.easeOut,
+//       );
+//     });
+//   }
+//
+//   void _scrollAfterIncoming() {
+//     if (!_scrollCtrl.hasClients) return;
+//     final atBottom = _scrollCtrl.position.pixels >= _scrollCtrl.position.maxScrollExtent - 120;
+//     if (atBottom) _scrollToBottom();
+//   }
+//
+//   void _showSnack(String msg) {
+//     if (!mounted) return;
+//     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+//   }
+//
+//   void _send(Map<String, dynamic> payload) {
+//     final w = _ws;
+//     if (w == null) return;
+//     try { w.add(json.encode(payload)); } catch (_) {}
+//   }
+//
+//   // ===== Actions =====
+//   void _sendTypingStart() {
+//     _typingDebounce?.cancel();
+//     _typingDebounce = Timer(const Duration(milliseconds: 200), () {
+//       _send({ 'action': 'typing_start' });
+//     });
+//   }
+//
 //   Future<void> _sendText() async {
-//     final text = _msgCtrl.text.trim();
+//     if (_ws == null) return;
+//     final text = _textCtrl.text.trim();
 //     if (text.isEmpty) return;
 //
-//     setState(() => _sending = true);
-//     final provider = Provider.of<TelegraphProvider>(context, listen: false);
+//     setState(() { _sending = true; });
 //
-//     final payload = {
-//       "action": "send",
-//       "text": text,
-//       if (_replyToMsgId != null) "reply_to": _replyToMsgId,
-//       // Backward compatibility (older builds expected these again):
-//       "phone": widget.phone,
-//       "chat_id": widget.chatId,
-//       "access_hash": widget.accessHash,
-//       "client_instance": _clientInstance,
+//     final payload = <String, dynamic>{
+//       'action': 'send',
+//       'text': text,
+//       if (_replyToMsgId != null) 'reply_to': _replyToMsgId,
 //     };
+//     _send(payload);
 //
-//     try {
-//       // optimistic pending bubble
-//       final pendingId = "pending:${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(999999)}";
-//       provider.messages.insert(0, {
-//         "id": pendingId,
-//         "text": text,
-//         "is_out": true,
-//         "time": _nowIso(),
-//         "type": "text",
-//         "pending": true,
-//         "uploading": false,
-//         "progress": 0.0,
-//         "temp_id": null,
-//         if (_replyToMsgId != null) "reply_to": _replyToMsgId,
-//         if (_replyToMsgMap != null) "reply_preview": _replyPreviewText(_replyToMsgMap!),
-//       });
-//       _seenIds.add(pendingId);
-//       provider.notifyListeners();
-//
-//       _socket?.add(jsonEncode(payload));
-//       _msgCtrl.clear();
-//       _clearReply();
-//     } catch (e) {
-//       debugPrint("⚠️ send text error: $e");
-//     } finally {
-//       if (mounted) setState(() => _sending = false);
-//     }
+//     _textCtrl.clear();
+//     _clearReply();
+//     setState(() { _sending = false; });
 //   }
 //
-//   // ================================
-//   // Typing events
-//   // ================================
-//   void _typingStart() {
-//     _typingDebounce?.cancel();
-//     if (_socket?.readyState == WebSocket.open) {
-//       _socket!.add(jsonEncode({"action": "typing_start"}));
-//     }
-//     _typingDebounce = Timer(const Duration(seconds: 2), _typingStop);
-//   }
+//   Future<void> _sendImage() async {
+//     final picker = ImagePicker();
+//     final picked = await picker.pickImage(source: ImageSource.gallery, imageQuality: 92);
+//     if (picked == null) return;
+//     final bytes = await picked.readAsBytes();
+//     final b64 = base64Encode(bytes);
+//     final mime = lookupMimeType(picked.name) ?? 'image/jpeg';
 //
-//   void _typingStop() {
-//     if (_socket?.readyState == WebSocket.open) {
-//       _socket!.add(jsonEncode({"action": "typing_stop"}));
-//     }
-//   }
-//
-//   // ================================
-//   // Picker & Send File
-//   // ================================
-//   Future<void> _ensurePerms() async {
-//     await [Permission.camera, Permission.photos, Permission.storage].request();
-//   }
-//
-//   Future<void> _pickImage() async {
-//     await _ensurePerms();
-//     final img = await _picker.pickImage(source: ImageSource.gallery, imageQuality: 85);
-//     if (img != null) await _sendFile(File(img.path));
-//   }
-//
-//   Future<void> _pickVideo() async {
-//     await _ensurePerms();
-//     final vid = await _picker.pickVideo(source: ImageSource.gallery, maxDuration: const Duration(minutes: 2));
-//     if (vid != null) await _sendFile(File(vid.path));
-//   }
-//
-//   Future<void> _sendFile(File file) async {
-//     try {
-//       final bytes = await file.readAsBytes();
-//       final b64 = base64Encode(bytes);
-//       final fileName = p.basename(file.path);
-//       final mime = lookupMimeType(file.path, headerBytes: bytes) ?? "application/octet-stream";
-//       final dataUri = "data:$mime;base64,$b64";
-//
-//       final provider = Provider.of<TelegraphProvider>(context, listen: false);
-//       final pendingId = "pending:${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(999999)}";
-//       final kind = mime.startsWith('image/')
-//           ? "image"
-//           : (mime.startsWith('video/') ? "video" : (mime.startsWith('audio/') ? "audio" : "file"));
-//
-//       provider.messages.insert(0, {
-//         "id": pendingId,
-//         "text": "",
-//         "is_out": true,
-//         "time": _nowIso(),
-//         "type": kind,
-//         "local_path": file.path,
-//         "uploading": true,
-//         "progress": 0.0,
-//         "pending": true,
-//         "temp_id": null,
-//         if (_replyToMsgId != null) "reply_to": _replyToMsgId,
-//         if (_replyToMsgMap != null) "reply_preview": _replyPreviewText(_replyToMsgMap!),
-//       });
-//       _seenIds.add(pendingId);
-//       Provider.of<TelegraphProvider>(context, listen: false).notifyListeners();
-//
-//       _socket?.add(jsonEncode({
-//         "action": "send",
-//         "file_name": fileName,
-//         "file_base64": dataUri, // data: URI (spec supports raw or data:uri)
-//         "mime_type": mime,
-//         if (_replyToMsgId != null) "reply_to": _replyToMsgId,
-//         // Backward compatibility:
-//         "phone": widget.phone,
-//         "chat_id": widget.chatId,
-//         "access_hash": widget.accessHash,
-//         "client_instance": _clientInstance,
-//       }));
-//       _clearReply();
-//     } catch (e) {
-//       debugPrint("⚠️ send file error: $e");
-//     }
-//   }
-//
-//   // ================================
-//   // Mapping helpers
-//   // ================================
-//   Map<String, dynamic>? _mapServerMessage(dynamic data) {
-//     if (data == null) return null;
-//
-//     final id = (data["id"] ?? data["msg_id"] ?? data["temp_id"])?.toString();
-//     final text = (data["text"] ?? "") as String;
-//     final isOut = data["is_out"] == true || (data["direction"]?.toString() == "out");
-//     final date = (data["date"] ?? _nowIso()).toString();
-//     final mediaType = (data["media_type"] ?? data["type"] ?? "text").toString();
-//     final mediaLink = data["media_link"];
-//     final replyTo = (data["reply_to"] is int) ? data["reply_to"] as int : null;
-//
-//     if (mediaType == "call_audio" || mediaType == "call_video") {
-//       final call = (data["call"] ?? {}) as Map;
-//       return {
-//         "id": id,
-//         "text": _formatCallTitle(call, mediaType),
-//         "is_out": isOut,
-//         "time": date,
-//         "type": "call",
-//         "call_status": call["status"],
-//         "duration": call["duration"],
-//         "direction": call["direction"], // incoming/outgoing
-//         "pending": false,
-//       };
-//     }
-//
-//     // Normal text/file/image/video
-//     return {
-//       "id": id,
-//       "text": text,
-//       "is_out": isOut,
-//       "time": date,
-//       "type": _normalizeType(mediaType),
-//       "url": _resolveUrl(mediaLink),
-//       "pending": false,
-//       if (replyTo != null) "reply_to": replyTo,
+//     final dataUri = 'data:$mime;base64,$b64';
+//     final payload = <String, dynamic>{
+//       'action': 'send',
+//       'text': '',
+//       'file_base64': dataUri,
+//       'file_name': picked.name,
+//       'mime_type': mime,
+//       if (_replyToMsgId != null) 'reply_to': _replyToMsgId,
 //     };
-//   }
-//
-//   Map<String, dynamic>? _mapCallEvent(dynamic data) {
-//     final id = data["id"];
-//     final status = data["status"];
-//     final direction = data["direction"];
-//     final duration = data["duration"];
-//     final isVideo = data["is_video"] == true;
-//     final date = (data["date"] ?? _nowIso()).toString();
-//
-//     return {
-//       "id": id?.toString(),
-//       "text": isVideo ? "Video call" : "Voice call",
-//       "is_out": (direction == "outgoing"),
-//       "time": date,
-//       "type": "call",
-//       "call_status": status,
-//       "duration": duration,
-//       "direction": direction,
-//       "pending": false,
-//     };
-//   }
-//
-//   String _normalizeType(String t) {
-//     switch (t) {
-//       case "image":
-//       case "video":
-//       case "audio":
-//       case "voice":
-//       case "sticker":
-//       case "file":
-//         return t;
-//       default:
-//         return "text";
-//     }
-//   }
-//
-//   String? _resolveUrl(dynamic url) {
-//     if (url == null) return null;
-//     final u = url.toString();
-//     try {
-//       final uri = Uri.parse(u);
-//       if (uri.hasScheme && (uri.host == '127.0.0.1' || uri.host == 'localhost')) {
-//         final base = Uri.parse(_apiBase);
-//         return uri.replace(scheme: base.scheme, host: base.host, port: base.port).toString();
-//       }
-//       if (uri.hasScheme) return u;
-//     } catch (_) {
-//       // fallthrough
-//     }
-//     if (u.startsWith('/')) return '$_apiBase$u';
-//     return '$_apiBase/$u';
-//   }
-//
-//   String _formatCallTitle(Map call, String mediaType) {
-//     final status = (call["status"] ?? "").toString();
-//     final dur = call["duration"];
-//     final sec = (dur is num) ? dur.toInt() : null;
-//     final dir = (call["direction"] ?? "").toString(); // incoming/outgoing
-//     final t = mediaType == "call_video" ? "Video call" : "Voice call";
-//     final sd = (sec != null && sec > 0) ? " • ${_fmtDur(sec)}" : "";
-//     final d = dir.isNotEmpty ? (dir == "incoming" ? "Incoming" : "Outgoing") : "";
-//     return "$t • $status${sd}${d.isNotEmpty ? " • $d" : ""}";
-//   }
-//
-//   String _fmtDur(int s) {
-//     final h = s ~/ 3600;
-//     final m = (s % 3600) ~/ 60;
-//     final sec = s % 60;
-//     if (h > 0) {
-//       return "${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}";
-//     }
-//     return "${m.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}";
-//   }
-//
-//   String _nowIso() => DateTime.now().toUtc().toIso8601String();
-//
-//   // ================================
-//   // Reply helpers
-//   // ================================
-//   void _setReply(Map<String, dynamic> m) {
-//     setState(() {
-//       _replyToMsgMap = m;
-//       // Try parse numeric id
-//       final idStr = m["id"]?.toString();
-//       _replyToMsgId = int.tryParse(idStr ?? "");
-//     });
+//     _send(payload);
+//     _clearReply();
 //   }
 //
 //   void _clearReply() {
-//     setState(() {
-//       _replyToMsgId = null;
-//       _replyToMsgMap = null;
-//     });
+//     setState(() { _replyToMsgId = null; _replyPreviewText = null; });
 //   }
 //
-//   String _replyPreviewText(Map m) {
-//     final t = (m["text"] ?? "").toString();
-//     final kind = (m["type"] ?? "text").toString();
-//     if (t.isNotEmpty) return t.length > 40 ? "${t.substring(0, 40)}…" : t;
-//     return "[$kind]";
-//   }
+//   String _makeTempId() => 'local-${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(1<<32)}';
 //
-//   // ================================
-//   // UI
-//   // ================================
+//   // ===== UI =====
 //   @override
 //   Widget build(BuildContext context) {
-//     final provider = Provider.of<TelegraphProvider>(context);
+//     final theme = Theme.of(context);
 //
 //     return Scaffold(
-//       backgroundColor: const Color(0xFFE5DDD5),
 //       appBar: AppBar(
-//         backgroundColor: const Color(0xFF008069),
-//         title: Row(children: [
-//           const CircleAvatar(backgroundColor: Colors.white, child: Icon(Icons.person, color: Colors.black)),
-//           const SizedBox(width: 10),
-//           Expanded(
-//             child: Column(
-//               crossAxisAlignment: CrossAxisAlignment.start,
-//               children: [
-//                 Text(widget.name, style: const TextStyle(color: Colors.white, fontSize: 18)),
-//                 Text(
-//                   _typing ? "typing..." : "online",
-//                   style: const TextStyle(color: Colors.white70, fontSize: 12),
-//                 ),
-//               ],
-//             ),
-//           ),
-//         ]),
-//       ),
-//       body: _loading
-//           ? const Center(child: CircularProgressIndicator())
-//           : Column(children: [
-//         if (_replyToMsgMap != null)
-//           Container(
-//             color: const Color(0xFFeafaf5),
-//             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-//             child: Row(children: [
-//               const Icon(Icons.reply, color: Colors.green),
-//               const SizedBox(width: 8),
-//               Expanded(
-//                 child: Text(_replyPreviewText(_replyToMsgMap!), maxLines: 1, overflow: TextOverflow.ellipsis),
-//               ),
-//               IconButton(onPressed: _clearReply, icon: const Icon(Icons.close, size: 18))
-//             ]),
-//           ),
-//         Expanded(
-//           child: ListView.builder(
-//             controller: _scrollController,
-//             reverse: true, // newest at top
-//             itemCount: provider.messages.length,
-//             itemBuilder: (context, i) {
-//               final msg = provider.messages[i];
-//               final isOut = msg["is_out"] == true;
-//               final time = (msg["time"] ?? "") as String;
-//
-//               return GestureDetector(
-//                 onLongPress: () => _showMsgMenu(msg),
-//                 child: Align(
-//                   alignment: isOut ? Alignment.centerRight : Alignment.centerLeft,
-//                   child: Container(
-//                     margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
-//                     padding: const EdgeInsets.all(10),
-//                     decoration: BoxDecoration(
-//                       color: isOut ? Colors.green.shade400 : Colors.grey.shade300,
-//                       borderRadius: BorderRadius.circular(14),
-//                     ),
-//                     child: Column(
-//                       crossAxisAlignment: CrossAxisAlignment.end,
-//                       children: [
-//                         _bubbleContent(msg, isOut),
-//                         if (msg["uploading"] == true)
-//                           Padding(
-//                             padding: const EdgeInsets.only(top: 6),
-//                             child: SizedBox(
-//                               width: 160,
-//                               child: LinearProgressIndicator(
-//                                 value: ((msg["progress"] ?? 0.0) as num).clamp(0, 100) / 100.0,
-//                                 minHeight: 4,
-//                                 backgroundColor: Colors.white24,
-//                               ),
-//                             ),
-//                           ),
-//                         Padding(
-//                           padding: const EdgeInsets.only(top: 4),
-//                           child: Text(
-//                             time,
-//                             style: TextStyle(color: isOut ? Colors.white70 : Colors.grey[700], fontSize: 11),
-//                           ),
-//                         ),
-//                       ],
-//                     ),
-//                   ),
-//                 ),
-//               );
-//             },
-//           ),
-//         ),
-//         Container(
-//           color: Colors.white,
-//           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-//           child: Row(children: [
-//             IconButton(icon: const Icon(Icons.attach_file, color: Colors.green), onPressed: _showAttachmentMenu),
+//         titleSpacing: 0,
+//         title: Row(
+//           children: [
+//             CircleAvatar(child: Text(widget.name.isNotEmpty ? widget.name.characters.first : 'U')),
+//             const SizedBox(width: 8),
 //             Expanded(
-//               child: TextField(
-//                 controller: _msgCtrl,
-//                 onChanged: (_) => _typingStart(),
-//                 onEditingComplete: _typingStop,
-//                 decoration: const InputDecoration(hintText: "Type a message", border: InputBorder.none),
+//               child: Column(
+//                 crossAxisAlignment: CrossAxisAlignment.start,
+//                 mainAxisSize: MainAxisSize.min,
+//                 children: [
+//                   Text(widget.name, style: const TextStyle(fontWeight: FontWeight.w600)),
+//                   Text(_subtitleText(), style: theme.textTheme.bodySmall),
+//                 ],
 //               ),
 //             ),
-//             IconButton(
-//               icon: _sending
-//                   ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2))
-//                   : const Icon(Icons.send, color: Colors.green),
-//               onPressed: _sending ? null : _sendText,
-//             ),
-//           ]),
+//           ],
 //         ),
-//       ]),
-//     );
-//   }
-//
-//   void _showAttachmentMenu() {
-//     showModalBottomSheet(
-//       context: context,
-//       builder: (ctx) => SafeArea(
-//         child: Wrap(children: [
-//           ListTile(
-//             leading: const Icon(Icons.photo, color: Colors.green),
-//             title: const Text("Send Image"),
-//             onTap: () {
-//               Navigator.pop(ctx);
-//               _pickImage();
+//         actions: [
+//           IconButton(
+//             icon: const Icon(Icons.refresh),
+//             onPressed: () {
+//               _ws?.close();
+//               _connect();
 //             },
 //           ),
-//           ListTile(
-//             leading: const Icon(Icons.videocam, color: Colors.green),
-//             title: const Text("Send Video"),
-//             onTap: () {
-//               Navigator.pop(ctx);
-//               _pickVideo();
-//             },
-//           ),
-//         ]),
+//         ],
 //       ),
-//     );
-//   }
-//
-//   void _showMsgMenu(Map<String, dynamic> m) {
-//     showModalBottomSheet(
-//       context: context,
-//       builder: (_) => SafeArea(
-//         child: Column(mainAxisSize: MainAxisSize.min, children: [
-//           ListTile(
-//             leading: const Icon(Icons.reply),
-//             title: const Text('Reply'),
-//             onTap: () {
-//               Navigator.pop(context);
-//               _setReply(m);
-//             },
-//           ),
-//           if ((m["text"] ?? "").toString().isNotEmpty)
-//             ListTile(
-//               leading: const Icon(Icons.copy),
-//               title: const Text('Copy text'),
-//               onTap: () async {
-//                 await Clipboard.setData(ClipboardData(text: (m["text"] ?? "").toString()));
-//                 if (mounted) Navigator.pop(context);
-//                 if (mounted) {
-//                   ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Copied')));
+//       body: Column(
+//         children: [
+//           if (_replyToMsgId != null) _buildReplyBar(),
+//           Expanded(
+//             child: ListView.builder(
+//               controller: _scrollCtrl,
+//               padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 10),
+//               itemCount: _messages.length + 1,
+//               itemBuilder: (_, i) {
+//                 if (i == _messages.length) {
+//                   return _buildTypingRow();
 //                 }
+//                 final m = _messages[i];
+//                 return _MessageBubble(
+//                   key: ValueKey('msg-${m.id ?? m.tempId ?? i}'),
+//                   msg: m,
+//                   onLongPress: () {
+//                     setState(() {
+//                       _replyToMsgId = m.id; // Only real msg_id supported by server
+//                       _replyPreviewText = m.previewText();
+//                     });
+//                   },
+//                   onTapMedia: () async {
+//                     final url = m.mediaLink;
+//                     if (url == null || url.isEmpty) return;
+//                     final uri = Uri.parse(url);
+//                     if (await canLaunchUrl(uri)) {
+//                       await launchUrl(uri, mode: LaunchMode.externalApplication);
+//                     }
+//                   },
+//                 );
 //               },
 //             ),
-//         ]),
+//           ),
+//           _buildComposer(),
+//         ],
 //       ),
 //     );
 //   }
 //
-//   // ================================
-//   // Bubble content
-//   // ================================
-//   Widget _bubbleContent(Map<String, dynamic> msg, bool isOut) {
-//     final type = (msg["type"] ?? "text") as String;
-//     final text = (msg["text"] ?? "") as String;
-//     final bool isDeleted = msg["is_deleted"] == true;
+//   String _subtitleText() {
+//     if (!_listening) return 'connecting…';
+//     if (!_seedArrived) return 'loading history…';
+//     if (_typingUserIds.isNotEmpty) return 'typing…';
+//     return 'online';
+//   }
 //
-//     final textColor = isDeleted ? Colors.red : (isOut ? Colors.white : Colors.black87);
+//   Widget _buildTypingRow() {
+//     if (_typingUserIds.isEmpty) return const SizedBox.shrink();
+//     return Padding(
+//       padding: const EdgeInsets.only(left: 12, bottom: 8),
+//       child: Text('typing…', style: TextStyle(color: Colors.grey[600], fontStyle: FontStyle.italic)),
+//     );
+//   }
 //
-//     // reply preview inline (if any)
-//     final replyPreview = msg["reply_preview"];
-//     final replyChip = (replyPreview != null && replyPreview.toString().isNotEmpty)
-//         ? Container(
-//       margin: const EdgeInsets.only(bottom: 6),
-//       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+//   Widget _buildReplyBar() {
+//     return Container(
+//       width: double.infinity,
+//       color: Colors.grey.shade200,
+//       padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 10),
+//       child: Row(
+//         children: [
+//           const Icon(Icons.reply, size: 18),
+//           const SizedBox(width: 6),
+//           Expanded(
+//             child: Text(
+//               _replyPreviewText ?? 'Replying…',
+//               maxLines: 1,
+//               overflow: TextOverflow.ellipsis,
+//             ),
+//           ),
+//           IconButton(
+//             onPressed: _clearReply,
+//             icon: const Icon(Icons.close, size: 18),
+//           )
+//         ],
+//       ),
+//     );
+//   }
+//
+//   Widget _buildComposer() {
+//     return SafeArea(
+//       top: false,
+//       child: Padding(
+//         padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+//         child: Row(
+//           children: [
+//             IconButton(
+//               tooltip: 'Image',
+//               onPressed: _sendImage,
+//               icon: const Icon(Icons.image),
+//             ),
+//             Expanded(
+//               child: TextField(
+//                 controller: _textCtrl,
+//                 minLines: 1,
+//                 maxLines: 5,
+//                 onChanged: (_) => _sendTypingStart(),
+//                 decoration: const InputDecoration(
+//                   hintText: 'Message',
+//                   isDense: true,
+//                   border: OutlineInputBorder(),
+//                 ),
+//               ),
+//             ),
+//             const SizedBox(width: 8),
+//             IconButton(
+//               onPressed: _sending ? null : _sendText,
+//               icon: const Icon(Icons.send),
+//             ),
+//           ],
+//         ),
+//       ),
+//     );
+//   }
+// }
+//
+// DateTime _parseIso(dynamic v) {
+//   if (v is String) {
+//     try { return DateTime.parse(v).toUtc(); } catch (_) {}
+//   }
+//   return DateTime.now().toUtc();
+// }
+//
+// enum MessageStatus { pending, sent, failed }
+//
+// class ChatMessage {
+//   int? id; // Telegram msg_id
+//   String? tempId; // local id for pending
+//   String text;
+//   int? senderId;
+//   String senderName;
+//   DateTime date;
+//   bool isOut;
+//   int? replyTo;
+//   String? mediaType; // text|image|video|audio|voice|sticker|file|call_audio|call_video
+//   String? mediaLink; // for non-text
+//   CallInfo? call;
+//   bool deletedOnTelegram;
+//   bool existsOnTelegram;
+//   double uploadProgress; // 0..100 for pending file uploads
+//   MessageStatus status;
+//
+//   ChatMessage({
+//     required this.id,
+//     required this.tempId,
+//     required this.text,
+//     required this.date,
+//     required this.isOut,
+//     required this.senderId,
+//     required this.senderName,
+//     required this.replyTo,
+//     required this.mediaType,
+//     required this.mediaLink,
+//     required this.call,
+//     required this.deletedOnTelegram,
+//     required this.existsOnTelegram,
+//     required this.uploadProgress,
+//     this.status = MessageStatus.sent,
+//   });
+//
+//   factory ChatMessage.fromJson(Map<String, dynamic> m) {
+//     return ChatMessage(
+//       id: (m['id'] is int) ? m['id'] as int : int.tryParse(m['id']?.toString() ?? ''),
+//       tempId: m['temp_id']?.toString(),
+//       text: (m['text'] ?? '').toString(),
+//       senderId: (m['sender_id'] is int) ? m['sender_id'] as int : null,
+//       senderName: (m['sender_name'] ?? '').toString(),
+//       date: _parseIso(m['date']),
+//       isOut: (m['is_out'] == true),
+//       replyTo: (m['reply_to'] is int) ? m['reply_to'] as int : null,
+//       mediaType: m['media_type']?.toString(),
+//       mediaLink: m['media_link']?.toString(),
+//       call: (m['call'] is Map) ? CallInfo.fromJson(m['call'] as Map<String, dynamic>) : null,
+//       deletedOnTelegram: m['deleted_on_telegram'] == true,
+//       existsOnTelegram: m['exists_on_telegram'] != false, // default true when msg_id exists
+//       uploadProgress: 0.0,
+//       status: MessageStatus.sent,
+//     );
+//   }
+//
+//   void mergeFrom(ChatMessage other) {
+//     id = other.id ?? id;
+//     tempId = other.tempId ?? tempId;
+//     text = other.text.isNotEmpty ? other.text : text;
+//     senderId = other.senderId ?? senderId;
+//     senderName = other.senderName.isNotEmpty ? other.senderName : senderName;
+//     date = other.date; // keep latest
+//     isOut = other.isOut;
+//     replyTo = other.replyTo ?? replyTo;
+//     mediaType = other.mediaType ?? mediaType;
+//     mediaLink = other.mediaLink ?? mediaLink;
+//     call = other.call ?? call;
+//     deletedOnTelegram = other.deletedOnTelegram;
+//     existsOnTelegram = other.existsOnTelegram;
+//     uploadProgress = other.uploadProgress != 0.0 ? other.uploadProgress : uploadProgress;
+//     status = other.status;
+//   }
+//
+//   String previewText() {
+//     if ((mediaType ?? 'text') != 'text' && (text.isEmpty)) {
+//       return '[${mediaType ?? 'media'}]';
+//     }
+//     return text;
+//   }
+// }
+//
+// class CallInfo {
+//   final String status; // missed|busy|canceled|ended|accepted|ongoing|requested|unknown
+//   final int? duration; // seconds
+//   final bool isVideo;
+//   final String? reason; // raw TL name
+//   final String direction; // incoming|outgoing
+//
+//   CallInfo({
+//     required this.status,
+//     required this.duration,
+//     required this.isVideo,
+//     required this.reason,
+//     required this.direction,
+//   });
+//
+//   factory CallInfo.fromJson(Map<String, dynamic> m) {
+//     return CallInfo(
+//       status: (m['status'] ?? 'unknown').toString(),
+//       duration: (m['duration'] is int) ? m['duration'] as int : null,
+//       isVideo: m['is_video'] == true,
+//       reason: m['reason']?.toString(),
+//       direction: (m['direction'] ?? 'incoming').toString(),
+//     );
+//   }
+// }
+//
+// class _MessageBubble extends StatelessWidget {
+//   final ChatMessage msg;
+//   final VoidCallback? onLongPress;
+//   final VoidCallback? onTapMedia;
+//
+//   const _MessageBubble({super.key, required this.msg, this.onLongPress, this.onTapMedia});
+//
+//   @override
+//   Widget build(BuildContext context) {
+//     final align = msg.isOut ? CrossAxisAlignment.end : CrossAxisAlignment.start;
+//     final bubbleColor = msg.isOut ? Colors.blue.shade100 : Colors.grey.shade200;
+//     final textColor = Colors.black87;
+//
+//     final bubble = ConstrainedBox(
+//       constraints: const BoxConstraints(maxWidth: 320),
+//       child: Container(
+//         padding: const EdgeInsets.all(10),
+//         decoration: BoxDecoration(
+//           color: bubbleColor,
+//           borderRadius: BorderRadius.circular(12),
+//         ),
+//         child: Column(
+//           crossAxisAlignment: CrossAxisAlignment.start,
+//           children: [
+//             if (!msg.isOut && msg.senderName.isNotEmpty)
+//               Padding(
+//                 padding: const EdgeInsets.only(bottom: 4),
+//                 child: Text(msg.senderName, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+//               ),
+//             _buildBody(context),
+//             const SizedBox(height: 6),
+//             Row(
+//               mainAxisSize: MainAxisSize.min,
+//               children: [
+//                 Text(_fmtTime(msg.date), style: const TextStyle(fontSize: 10, color: Colors.black54)),
+//                 const SizedBox(width: 6),
+//                 if (msg.status == MessageStatus.pending)
+//                   const Icon(Icons.schedule, size: 12, color: Colors.black45)
+//                 else if (msg.status == MessageStatus.failed)
+//                   const Icon(Icons.error_outline, size: 12, color: Colors.redAccent)
+//               ],
+//             ),
+//           ],
+//         ),
+//       ),
+//     );
+//
+//     return Padding(
+//       padding: const EdgeInsets.symmetric(vertical: 4),
+//       child: Row(
+//         mainAxisAlignment: msg.isOut ? MainAxisAlignment.end : MainAxisAlignment.start,
+//         crossAxisAlignment: CrossAxisAlignment.start,
+//         children: [
+//           if (!msg.isOut) const SizedBox(width: 36),
+//           GestureDetector(onLongPress: onLongPress, child: bubble),
+//           if (msg.isOut) const SizedBox(width: 36),
+//         ],
+//       ),
+//     );
+//   }
+//
+//   Widget _buildBody(BuildContext context) {
+//     final mt = (msg.mediaType ?? 'text');
+//     final List<Widget> children = [];
+//
+//     if (msg.replyTo != null)
+//       children.add(
+//         Container(
+//           padding: const EdgeInsets.all(8),
+//           margin: const EdgeInsets.only(bottom: 6),
+//           decoration: BoxDecoration(
+//             color: Colors.white.withOpacity(0.6),
+//             borderRadius: BorderRadius.circular(8),
+//           ),
+//           child: Text('Reply to #${msg.replyTo}', style: const TextStyle(fontSize: 11, color: Colors.black54)),
+//         ),
+//       );
+//
+//     if (mt == 'text') {
+//       if (msg.text.isNotEmpty) {
+//         children.add(SelectableText(msg.text, style: const TextStyle(fontSize: 15)));
+//       } else {
+//         children.add(const Text('[empty]', style: TextStyle(fontSize: 15, fontStyle: FontStyle.italic)));
+//       }
+//     } else if (mt == 'image') {
+//       if ((msg.mediaLink ?? '').isNotEmpty) {
+//         children.add(
+//           GestureDetector(
+//             onTap: onTapMedia,
+//             child: ClipRRect(
+//               borderRadius: BorderRadius.circular(10),
+//               child: Image.network(
+//                 msg.mediaLink!,
+//                 fit: BoxFit.cover,
+//                 loadingBuilder: (context, child, progress) {
+//                   if (progress == null) return child;
+//                   final v = progress.expectedTotalBytes == null
+//                       ? null
+//                       : progress.cumulativeBytesLoaded / (progress.expectedTotalBytes!);
+//                   return SizedBox(
+//                     height: 180,
+//                     width: 240,
+//                     child: Center(child: CircularProgressIndicator(value: v)),
+//                   );
+//                 },
+//                 errorBuilder: (_, __, ___) => Container(
+//                   color: Colors.black12,
+//                   height: 180,
+//                   width: 240,
+//                   alignment: Alignment.center,
+//                   child: const Icon(Icons.broken_image),
+//                 ),
+//               ),
+//             ),
+//           ),
+//         );
+//       } else {
+//         // pending upload
+//         children.add(_uploadProgressBar());
+//       }
+//       if (msg.text.isNotEmpty) {
+//         children.add(const SizedBox(height: 6));
+//         children.add(Text(msg.text));
+//       }
+//     } else if (mt.startsWith('call_') && msg.call != null) {
+//       children.add(
+//         _CallChip(call: msg.call!),
+//       );
+//     } else {
+//       // generic file/video/audio/voice/sticker placeholder
+//       children.add(
+//         InkWell(
+//           onTap: onTapMedia,
+//           child: Row(children: [
+//             const Icon(Icons.attach_file),
+//             const SizedBox(width: 8),
+//             Expanded(child: Text('[${mt}] tap to open', overflow: TextOverflow.ellipsis)),
+//           ]),
+//         ),
+//       );
+//       if (msg.text.isNotEmpty) {
+//         children.add(const SizedBox(height: 6));
+//         children.add(Text(msg.text));
+//       }
+//       if (msg.status == MessageStatus.pending) {
+//         children.add(const SizedBox(height: 6));
+//         children.add(_uploadProgressBar());
+//       }
+//     }
+//
+//     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: children);
+//   }
+//
+//   Widget _uploadProgressBar() {
+//     return Column(
+//       crossAxisAlignment: CrossAxisAlignment.start,
+//       children: [
+//         LinearProgressIndicator(value: (msg.uploadProgress > 0 && msg.uploadProgress <= 100) ? msg.uploadProgress / 100.0 : null),
+//         const SizedBox(height: 4),
+//         Text('${msg.uploadProgress.toStringAsFixed(1)}%'),
+//       ],
+//     );
+//   }
+//
+//   String _fmtTime(DateTime dt) {
+//     final h = dt.toLocal().hour.toString().padLeft(2, '0');
+//     final m = dt.toLocal().minute.toString().padLeft(2, '0');
+//     return '$h:$m';
+//   }
+// }
+//
+// class _CallChip extends StatelessWidget {
+//   final CallInfo call;
+//   const _CallChip({required this.call});
+//
+//   @override
+//   Widget build(BuildContext context) {
+//     final isVideo = call.isVideo;
+//     final icon = isVideo ? Icons.videocam : Icons.call;
+//     final dur = call.duration != null ? _fmt(call.duration!) : null;
+//     final text = StringBuffer()
+//       ..write(call.direction)
+//       ..write(' ')
+//       ..write(call.status);
+//     if (dur != null) text.write(' • $dur');
+//
+//     return Container(
+//       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
 //       decoration: BoxDecoration(
-//         color: isOut ? Colors.white24 : Colors.black12,
-//         borderRadius: BorderRadius.circular(8),
+//         color: Colors.white.withOpacity(0.7),
+//         borderRadius: BorderRadius.circular(10),
+//         border: Border.all(color: Colors.black12),
 //       ),
 //       child: Row(
 //         mainAxisSize: MainAxisSize.min,
 //         children: [
-//           const Icon(Icons.reply, size: 14),
-//           const SizedBox(width: 6),
-//           Text(
-//             replyPreview.toString(),
-//             maxLines: 1,
-//             overflow: TextOverflow.ellipsis,
-//             style: TextStyle(fontSize: 12, color: isOut ? Colors.white : Colors.black87),
-//           ),
+//           Icon(icon, size: 18),
+//           const SizedBox(width: 8),
+//           Text(text.toString()),
 //         ],
 //       ),
-//     )
-//         : const SizedBox.shrink();
-//
-//     // CALL MESSAGE
-//     if (type == "call" || type == "call_audio" || type == "call_video") {
-//       final status = msg["call_status"]?.toString() ?? "";
-//       final direction = msg["direction"]?.toString() ?? "";
-//       final bool isVideo = type == "call_video";
-//
-//       IconData icon;
-//       Color iconColor;
-//       String label;
-//
-//       if (status == "missed") {
-//         icon = isVideo ? Icons.videocam_off : Icons.call_missed;
-//         iconColor = Colors.redAccent;
-//         label = isVideo ? "Missed Video Call" : "Missed Voice Call";
-//       } else if (status == "ended") {
-//         icon = isVideo ? Icons.videocam : Icons.call_end;
-//         iconColor = Colors.green;
-//         label = isVideo ? "Video Call Ended" : "Voice Call Ended";
-//       } else if (status == "busy") {
-//         icon = isVideo ? Icons.videocam : Icons.call_end;
-//         iconColor = Colors.orange;
-//         label = isVideo ? "Video Call Busy" : "Voice Call Busy";
-//       } else {
-//         icon = isVideo ? Icons.videocam : Icons.phone;
-//         iconColor = Colors.blueGrey;
-//         label = isVideo ? "Video Call" : "Voice Call";
-//       }
-//
-//       return Column(
-//         crossAxisAlignment: CrossAxisAlignment.start,
-//         children: [
-//           replyChip,
-//           Container(
-//             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-//             decoration: BoxDecoration(
-//               color: isOut ? Colors.white.withOpacity(0.1) : Colors.black12,
-//               borderRadius: BorderRadius.circular(8),
-//             ),
-//             child: Row(
-//               mainAxisSize: MainAxisSize.min,
-//               children: [
-//                 Icon(icon, color: iconColor, size: 20),
-//                 const SizedBox(width: 6),
-//                 Flexible(
-//                   child: Text(
-//                     "$label (${direction == 'incoming' ? 'Incoming' : 'Outgoing'})",
-//                     style: TextStyle(
-//                       color: textColor,
-//                       fontWeight: FontWeight.w600,
-//                       fontStyle: isDeleted ? FontStyle.italic : FontStyle.normal,
-//                     ),
-//                   ),
-//                 ),
-//               ],
-//             ),
-//           ),
-//         ],
-//       );
-//     }
-//
-//     // IMAGE
-//     if (type == "image") {
-//       final localPath = msg["local_path"];
-//       final url = msg["url"];
-//       const w = 220.0, h = 260.0;
-//
-//       Widget imageChild;
-//       if (localPath != null) {
-//         imageChild = Image.file(File(localPath), width: w, height: h, fit: BoxFit.cover);
-//       } else if (url != null) {
-//         imageChild = Image.network(_resolveUrl(url)!, width: w, height: h, fit: BoxFit.cover);
-//       } else {
-//         imageChild = Container(width: w, height: h, color: Colors.grey, child: const Icon(Icons.image));
-//       }
-//
-//       return Column(
-//         crossAxisAlignment: CrossAxisAlignment.start,
-//         children: [
-//           replyChip,
-//           ClipRRect(borderRadius: BorderRadius.circular(10), child: imageChild),
-//           if (text.isNotEmpty) const SizedBox(height: 6),
-//           if (text.isNotEmpty) Text(text, style: TextStyle(color: textColor)),
-//         ],
-//       );
-//     }
-//
-//     // VIDEO (simple label; thumbnail/player can be added later)
-//     if (type == "video") {
-//       return Column(
-//         crossAxisAlignment: CrossAxisAlignment.start,
-//         children: [
-//           replyChip,
-//           Row(mainAxisSize: MainAxisSize.min, children: [
-//             const Icon(Icons.videocam, color: Colors.blue),
-//             const SizedBox(width: 8),
-//             Text("Video", style: TextStyle(color: textColor)),
-//           ]),
-//           if (text.isNotEmpty) const SizedBox(height: 6),
-//           if (text.isNotEmpty) Text(text, style: TextStyle(color: textColor)),
-//         ],
-//       );
-//     }
-//
-//     // AUDIO / VOICE
-//     if (type == "audio" || type == "voice") {
-//       return Column(
-//         crossAxisAlignment: CrossAxisAlignment.start,
-//         children: [
-//           replyChip,
-//           Row(mainAxisSize: MainAxisSize.min, children: [
-//             const Icon(Icons.audiotrack, color: Colors.orangeAccent),
-//             const SizedBox(width: 8),
-//             Text(type == "voice" ? "Voice message" : "Audio", style: TextStyle(color: textColor)),
-//           ]),
-//           if (text.isNotEmpty) const SizedBox(height: 6),
-//           if (text.isNotEmpty) Text(text, style: TextStyle(color: textColor)),
-//         ],
-//       );
-//     }
-//
-//     // TEXT
-//     return Column(
-//       crossAxisAlignment: CrossAxisAlignment.start,
-//       children: [
-//         replyChip,
-//         Text(
-//           text,
-//           style: TextStyle(
-//             color: textColor,
-//             fontSize: 15,
-//             fontStyle: isDeleted ? FontStyle.italic : FontStyle.normal,
-//             fontWeight: isDeleted ? FontWeight.bold : FontWeight.normal,
-//           ),
-//         ),
-//       ],
 //     );
 //   }
+//
+//   String _fmt(int s) {
+//     final m = (s ~/ 60).toString().padLeft(2, '0');
+//     final ss = (s % 60).toString().padLeft(2, '0');
+//     return '$m:$ss';
+//   }
 // }
+// ChatScreen.dart — WebSocket client for ws(s)://<HOST>/chat_ws
+// Added (without breaking your existing logic):
+// 1) exists_on_telegram == false → ghost style (text: italic+fade, image: grayscale+fade)
+// 2) Rich reply preview (shows replied message content/type)
+// 3) Swipe‑to‑reply (drag right) + Long‑press menu (Reply / Copy text / Copy media link)
+// Keeps: INIT, seed/new_message, send text & image, typing, ping, upload progress, send_done, urlLocal
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // Clipboard
+import 'package:image_picker/image_picker.dart';
+import 'package:mime/mime.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+import '../url.dart';
+
+class ChatScreen extends StatefulWidget {
+  final String phone;
+  final int chatId;
+  final int? accessHash; // optional
+  final String name;
+  final String username;
+
+  const ChatScreen({
+    super.key,
+    required this.phone,
+    required this.chatId,
+    required this.accessHash,
+    required this.name,
+    required this.username,
+  });
+
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends State<ChatScreen> {
+  // WebSocket
+  WebSocket? _ws;
+  bool _connecting = false;
+  bool _manuallyClosed = false;
+  int _reconnectAttempt = 0;
+
+  // Heartbeat / typing
+  Timer? _pingTimer;
+  Timer? _typingDebounce;
+  final Set<int> _typingUserIds = <int>{};
+  Timer? _typingTtlSweeper;
+  final Map<int, DateTime> _typingTtl = {}; // senderId -> expiry
+
+  // UI
+  final TextEditingController _textCtrl = TextEditingController();
+  final ScrollController _scrollCtrl = ScrollController();
+  bool _seedArrived = false;
+  bool _listening = false;
+  bool _sending = false;
+
+  // Reply context
+  int? _replyToMsgId;
+  String? _replyPreviewText;
+
+  // Messages (oldest → newest)
+  final List<ChatMessage> _messages = [];
+  final Map<int, ChatMessage> _byId = {};
+  final Map<String, ChatMessage> _byTemp = {};
+
+  // ===== URL helpers =====
+  String get _wsUrl {
+    final base = urlLocal.trim();
+    final uri = Uri.parse(base);
+    final isHttps = uri.scheme == 'https';
+    final scheme = isHttps ? 'wss' : 'ws';
+    final path = uri.path.endsWith('/') ? '${uri.path}chat_ws' : '${uri.path}/chat_ws';
+    final wsUri = Uri(scheme: scheme, host: uri.host, port: uri.hasPort ? uri.port : null, path: path);
+    return wsUri.toString();
+  }
+
+  String rewriteMediaLink(String? link) {
+    if (link == null || link.isEmpty) return '';
+    final api = Uri.parse(urlLocal);
+    Uri uri;
+    try { uri = Uri.parse(link); } catch (_) { return link; }
+
+    final isLocal = (uri.host == '127.0.0.1') || (uri.host == 'localhost');
+    if (!isLocal) return link; // already absolute external
+
+    final newUri = Uri(
+      scheme: api.scheme,
+      host: api.host,
+      port: api.hasPort ? api.port : null,
+      path: uri.path,
+      query: uri.query,
+    );
+    return newUri.toString();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _connect();
+  }
+
+  @override
+  void dispose() {
+    _manuallyClosed = true;
+    _pingTimer?.cancel();
+    _typingDebounce?.cancel();
+    _typingTtlSweeper?.cancel();
+    _ws?.close();
+    _textCtrl.dispose();
+    _scrollCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _connect() async {
+    if (_connecting) return;
+    _connecting = true;
+    _manuallyClosed = false;
+
+    try {
+      setState(() { _listening = false; });
+      _ws = await WebSocket.connect(_wsUrl);
+      _reconnectAttempt = 0;
+
+      // INIT as first frame
+      final initPayload = {
+        'phone': widget.phone,
+        'chat_id': widget.chatId,
+        if (widget.accessHash != null) 'access_hash': widget.accessHash,
+      };
+      _send(initPayload);
+
+      _startPing();
+      _startTypingSweeper();
+
+      _ws!.listen(
+            (dynamic data) {
+          if (data is String) {
+            _handleFrameString(data);
+          } else if (data is List<int>) {
+            _handleFrameString(utf8.decode(data));
+          }
+        },
+        cancelOnError: true,
+        onDone: _onSocketDone,
+        onError: (err) { _onSocketDone(); },
+      );
+    } catch (e) {
+      _scheduleReconnect();
+    } finally {
+      _connecting = false;
+    }
+  }
+
+  void _onSocketDone() {
+    _pingTimer?.cancel();
+    _typingTtlSweeper?.cancel();
+    if (!_manuallyClosed) {
+      _scheduleReconnect();
+    }
+  }
+
+  void _scheduleReconnect() {
+    if (_manuallyClosed) return;
+    _reconnectAttempt++;
+    final delay = min(30, pow(2, _reconnectAttempt).toInt()); // 2,4,8,16,30
+    Future.delayed(Duration(seconds: delay), () {
+      if (mounted && !_manuallyClosed) _connect();
+    });
+  }
+
+  void _startPing() {
+    _pingTimer?.cancel();
+    _pingTimer = Timer.periodic(const Duration(seconds: 25), (_) {
+      _send({ 'action': 'ping' });
+    });
+  }
+
+  void _startTypingSweeper() {
+    _typingTtlSweeper?.cancel();
+    _typingTtlSweeper = Timer.periodic(const Duration(seconds: 2), (_) {
+      final now = DateTime.now().toUtc();
+      final expired = _typingTtl.entries.where((e) => e.value.isBefore(now)).map((e) => e.key).toList();
+      if (expired.isNotEmpty) {
+        for (final id in expired) {
+          _typingTtl.remove(id);
+          _typingUserIds.remove(id);
+        }
+        if (mounted) setState(() {});
+      }
+    });
+  }
+
+  void _handleFrameString(String s) {
+    Map<String, dynamic> m;
+    try { m = json.decode(s) as Map<String, dynamic>; } catch (_) { return; }
+
+    // Status frames
+    if (m['status'] == 'listening') {
+      setState(() { _listening = true; });
+      return;
+    }
+    if (m['status'] == 'pong') return;
+    if (m['status'] == 'error') {
+      final detail = m['detail']?.toString() ?? 'error';
+      _showSnack('Error: $detail');
+      return;
+    }
+
+    final action = m['action'];
+    switch (action) {
+      case 'seed':
+        final arr = (m['messages'] as List?) ?? [];
+        for (final it in arr) {
+          final msg = ChatMessage.fromJson(it as Map<String, dynamic>);
+          _insertOrUpdate(msg);
+        }
+        _seedArrived = true;
+        _scrollToBottom();
+        setState(() {});
+        break;
+      case 'new_message':
+        final msg = ChatMessage.fromJson(m);
+        _insertOrUpdate(msg);
+        _scrollAfterIncoming();
+        setState(() {});
+        break;
+      case 'send_queued':
+        final tempId = m['temp_id']?.toString() ?? _makeTempId();
+        final msg = ChatMessage(
+          id: null,
+          tempId: tempId,
+          text: (m['text'] ?? '').toString(),
+          date: _parseIso(m['date']) ?? DateTime.now().toUtc(),
+          isOut: true,
+          senderId: null,
+          senderName: widget.username,
+          replyTo: null,
+          mediaType: (m['media_type'] ?? 'text').toString(),
+          mediaLink: null,
+          call: null,
+          deletedOnTelegram: false,
+          existsOnTelegram: false,
+          uploadProgress: 0.0,
+          status: MessageStatus.pending,
+        );
+        _messages.add(msg);
+        _byTemp[tempId] = msg;
+        _scrollToBottom();
+        setState(() {});
+        break;
+      case 'upload_progress':
+        final tempId = m['temp_id']?.toString();
+        final p = (m['progress'] is num) ? (m['progress'] as num).toDouble() : null;
+        if (tempId != null && p != null) {
+          final item = _byTemp[tempId];
+          if (item != null) { item.uploadProgress = p; setState(() {}); }
+        }
+        break;
+      case 'send_done':
+        final tempId = m['temp_id']?.toString();
+        final msgId = m['msg_id'];
+        if (tempId != null && msgId is int) {
+          final item = _byTemp[tempId];
+          if (item != null) {
+            item.id = msgId;
+            item.existsOnTelegram = true;
+            item.status = MessageStatus.sent;
+            _byId[msgId] = item;
+            setState(() {});
+          }
+        }
+        break;
+      case 'send_failed':
+        final tempId = m['temp_id']?.toString();
+        if (tempId != null) {
+          final item = _byTemp[tempId];
+          if (item != null) { item.status = MessageStatus.failed; setState(() {}); _showSnack('Send failed: ${m['detail'] ?? ''}'); }
+        }
+        break;
+      case 'typing':
+        final sender = (m['sender_id'] is int) ? m['sender_id'] as int : null;
+        if (sender != null) {
+          _typingUserIds.add(sender);
+          _typingTtl[sender] = DateTime.now().toUtc().add(const Duration(seconds: 6));
+          setState(() {});
+        }
+        break;
+      case 'typing_stopped':
+        final sender = (m['sender_id'] is int) ? m['sender_id'] as int : null;
+        if (sender != null) {
+          _typingUserIds.remove(sender);
+          _typingTtl.remove(sender);
+          setState(() {});
+        }
+        break;
+      case '_hb':
+        break;
+      default:
+      // ignore
+    }
+  }
+
+  void _insertOrUpdate(ChatMessage msg) {
+    msg.mediaLink = rewriteMediaLink(msg.mediaLink);
+
+    if (msg.id != null) {
+      final existing = _byId[msg.id!];
+      if (existing != null) {
+        existing.mergeFrom(msg);
+      } else {
+        _byId[msg.id!] = msg;
+        _messages.add(msg);
+      }
+    } else if (msg.tempId != null) {
+      final existing = _byTemp[msg.tempId!];
+      if (existing != null) {
+        existing.mergeFrom(msg);
+      } else {
+        _byTemp[msg.tempId!] = msg;
+        _messages.add(msg);
+      }
+    } else {
+      _messages.add(msg);
+    }
+    _messages.sort((a, b) => a.date.compareTo(b.date));
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollCtrl.hasClients) return;
+      _scrollCtrl.animateTo(
+        _scrollCtrl.position.maxScrollExtent + 80,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  void _scrollAfterIncoming() {
+    if (!_scrollCtrl.hasClients) return;
+    final atBottom = _scrollCtrl.position.pixels >= _scrollCtrl.position.maxScrollExtent - 120;
+    if (atBottom) _scrollToBottom();
+  }
+
+  void _showSnack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  void _send(Map<String, dynamic> payload) {
+    final w = _ws;
+    if (w == null) return;
+    try { w.add(json.encode(payload)); } catch (_) {}
+  }
+
+  // ===== helpers for reply/copy =====
+  ChatMessage? _findById(int id) => _byId[id];
+
+  void _onReply(ChatMessage m) {
+    if (m.id == null) { _showSnack('Reply needs a real msg_id'); return; }
+    setState(() { _replyToMsgId = m.id; _replyPreviewText = m.previewText(); });
+  }
+
+  Future<void> _copyText(String t) async {
+    if (t.trim().isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: t));
+    _showSnack('Copied');
+  }
+
+  Future<void> _copyLink(String url) async {
+    await Clipboard.setData(ClipboardData(text: url));
+    _showSnack('Link copied');
+  }
+
+  void _showMsgMenu(ChatMessage m) {
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (_) {
+        final items = <Widget>[
+          ListTile(
+            leading: const Icon(Icons.reply),
+            title: const Text('Reply'),
+            onTap: () { Navigator.pop(context); _onReply(m); },
+          ),
+        ];
+        if ((m.text).trim().isNotEmpty) {
+          items.add(ListTile(
+            leading: const Icon(Icons.copy),
+            title: const Text('Copy text'),
+            onTap: () { Navigator.pop(context); _copyText(m.text); },
+          ));
+        }
+        if ((m.mediaLink ?? '').isNotEmpty) {
+          items.add(ListTile(
+            leading: const Icon(Icons.link),
+            title: const Text('Copy media link'),
+            onTap: () { Navigator.pop(context); _copyLink(m.mediaLink!); },
+          ));
+        }
+        return SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: items));
+      },
+    );
+  }
+
+  // ===== Actions =====
+  void _sendTypingStart() {
+    _typingDebounce?.cancel();
+    _typingDebounce = Timer(const Duration(milliseconds: 200), () {
+      _send({ 'action': 'typing_start' });
+    });
+  }
+
+  Future<void> _sendText() async {
+    if (_ws == null) return;
+    final text = _textCtrl.text.trim();
+    if (text.isEmpty) return;
+
+    setState(() { _sending = true; });
+
+    final payload = <String, dynamic>{
+      'action': 'send',
+      'text': text,
+      if (_replyToMsgId != null) 'reply_to': _replyToMsgId,
+    };
+    _send(payload);
+
+    _textCtrl.clear();
+    _clearReply();
+    setState(() { _sending = false; });
+  }
+
+  Future<void> _sendImage() async {
+    final picker = ImagePicker();
+    final picked = await picker.pickImage(source: ImageSource.gallery, imageQuality: 92);
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    final b64 = base64Encode(bytes);
+    final mime = lookupMimeType(picked.name) ?? 'image/jpeg';
+
+    final dataUri = 'data:$mime;base64,$b64';
+    final payload = <String, dynamic>{
+      'action': 'send',
+      'text': '',
+      'file_base64': dataUri,
+      'file_name': picked.name,
+      'mime_type': mime,
+      if (_replyToMsgId != null) 'reply_to': _replyToMsgId,
+    };
+    _send(payload);
+    _clearReply();
+  }
+
+  void _clearReply() {
+    setState(() { _replyToMsgId = null; _replyPreviewText = null; });
+  }
+
+  String _makeTempId() => 'local-${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(1<<32)}';
+
+  // ===== UI =====
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        titleSpacing: 0,
+        title: Row(
+          children: [
+            CircleAvatar(child: Text(widget.name.isNotEmpty ? widget.name.characters.first : 'U')),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(widget.name, style: const TextStyle(fontWeight: FontWeight.w600)),
+                  Text(_subtitleText(), style: theme.textTheme.bodySmall),
+                ],
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: () { _ws?.close(); _connect(); },
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          if (_replyToMsgId != null) _buildReplyBar(),
+          Expanded(
+            child: ListView.builder(
+              controller: _scrollCtrl,
+              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 10),
+              itemCount: _messages.length + 1,
+              itemBuilder: (_, i) {
+                if (i == _messages.length) { return _buildTypingRow(); }
+                final m = _messages[i];
+                return _MessageBubble(
+                  key: ValueKey('msg-${m.id ?? m.tempId ?? i}'),
+                  msg: m,
+                  findById: _findById,
+                  onSwipeReply: () => _onReply(m),
+                  onLongPress: () => _showMsgMenu(m),
+                  onTapMedia: () async {
+                    final url = m.mediaLink; if (url == null || url.isEmpty) return;
+                    final uri = Uri.parse(url);
+                    if (await canLaunchUrl(uri)) { await launchUrl(uri, mode: LaunchMode.externalApplication); }
+                  },
+                );
+              },
+            ),
+          ),
+          _buildComposer(),
+        ],
+      ),
+    );
+  }
+
+  String _subtitleText() {
+    if (!_listening) return 'connecting…';
+    if (!_seedArrived) return 'loading history…';
+    if (_typingUserIds.isNotEmpty) return 'typing…';
+    return 'online';
+  }
+
+  Widget _buildTypingRow() {
+    if (_typingUserIds.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(left: 12, bottom: 8),
+      child: Text('typing…', style: TextStyle(color: Colors.grey[600], fontStyle: FontStyle.italic)),
+    );
+  }
+
+  Widget _buildReplyBar() {
+    return Container(
+      width: double.infinity,
+      color: Colors.grey.shade200,
+      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 10),
+      child: Row(
+        children: [
+          const Icon(Icons.reply, size: 18),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              _replyPreviewText ?? 'Replying…',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          IconButton(onPressed: _clearReply, icon: const Icon(Icons.close, size: 18))
+        ],
+      ),
+    );
+  }
+
+  Widget _buildComposer() {
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+        child: Row(
+          children: [
+            IconButton(tooltip: 'Image', onPressed: _sendImage, icon: const Icon(Icons.image)),
+            Expanded(
+              child: TextField(
+                controller: _textCtrl,
+                minLines: 1,
+                maxLines: 5,
+                onChanged: (_) => _sendTypingStart(),
+                decoration: const InputDecoration(hintText: 'Message', isDense: true, border: OutlineInputBorder()),
+              ),
+            ),
+            const SizedBox(width: 8),
+            IconButton(onPressed: _sending ? null : _sendText, icon: const Icon(Icons.send)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+DateTime _parseIso(dynamic v) {
+  if (v is String) { try { return DateTime.parse(v).toUtc(); } catch (_) {} }
+  return DateTime.now().toUtc();
+}
+
+enum MessageStatus { pending, sent, failed }
+
+class ChatMessage {
+  int? id; // Telegram msg_id
+  String? tempId; // local id for pending
+  String text;
+  int? senderId;
+  String senderName;
+  DateTime date;
+  bool isOut;
+  int? replyTo;
+  String? mediaType; // text|image|video|audio|voice|sticker|file|call_audio|call_video
+  String? mediaLink; // for non-text
+  CallInfo? call;
+  bool deletedOnTelegram;
+  bool existsOnTelegram;
+  double uploadProgress; // 0..100 for pending file uploads
+  MessageStatus status;
+
+  ChatMessage({
+    required this.id,
+    required this.tempId,
+    required this.text,
+    required this.date,
+    required this.isOut,
+    required this.senderId,
+    required this.senderName,
+    required this.replyTo,
+    required this.mediaType,
+    required this.mediaLink,
+    required this.call,
+    required this.deletedOnTelegram,
+    required this.existsOnTelegram,
+    required this.uploadProgress,
+    this.status = MessageStatus.sent,
+  });
+
+  factory ChatMessage.fromJson(Map<String, dynamic> m) {
+    return ChatMessage(
+      id: (m['id'] is int) ? m['id'] as int : int.tryParse(m['id']?.toString() ?? ''),
+      tempId: m['temp_id']?.toString(),
+      text: (m['text'] ?? '').toString(),
+      senderId: (m['sender_id'] is int) ? m['sender_id'] as int : null,
+      senderName: (m['sender_name'] ?? '').toString(),
+      date: _parseIso(m['date']),
+      isOut: (m['is_out'] == true),
+      replyTo: (m['reply_to'] is int) ? m['reply_to'] as int : null,
+      mediaType: m['media_type']?.toString(),
+      mediaLink: m['media_link']?.toString(),
+      call: (m['call'] is Map) ? CallInfo.fromJson(m['call'] as Map<String, dynamic>) : null,
+      deletedOnTelegram: m['deleted_on_telegram'] == true,
+      existsOnTelegram: m['exists_on_telegram'] != false, // default true when msg_id exists
+      uploadProgress: 0.0,
+      status: MessageStatus.sent,
+    );
+  }
+
+  void mergeFrom(ChatMessage other) {
+    id = other.id ?? id;
+    tempId = other.tempId ?? tempId;
+    text = other.text.isNotEmpty ? other.text : text;
+    senderId = other.senderId ?? senderId;
+    senderName = other.senderName.isNotEmpty ? other.senderName : senderName;
+    date = other.date;
+    isOut = other.isOut;
+    replyTo = other.replyTo ?? replyTo;
+    mediaType = other.mediaType ?? mediaType;
+    mediaLink = other.mediaLink ?? mediaLink;
+    call = other.call ?? call;
+    deletedOnTelegram = other.deletedOnTelegram;
+    existsOnTelegram = other.existsOnTelegram;
+    uploadProgress = other.uploadProgress != 0.0 ? other.uploadProgress : uploadProgress;
+    status = other.status;
+  }
+
+  String previewText() {
+    if ((mediaType ?? 'text') != 'text' && (text.isEmpty)) {
+      return '[${mediaType ?? 'media'}]';
+    }
+    return text;
+  }
+}
+
+class CallInfo {
+  final String status; // missed|busy|canceled|ended|accepted|ongoing|requested|unknown
+  final int? duration; // seconds
+  final bool isVideo;
+  final String? reason; // raw TL name
+  final String direction; // incoming|outgoing
+
+  CallInfo({
+    required this.status,
+    required this.duration,
+    required this.isVideo,
+    required this.reason,
+    required this.direction,
+  });
+
+  factory CallInfo.fromJson(Map<String, dynamic> m) {
+    return CallInfo(
+      status: (m['status'] ?? 'unknown').toString(),
+      duration: (m['duration'] is int) ? m['duration'] as int : null,
+      isVideo: m['is_video'] == true,
+      reason: m['reason']?.toString(),
+      direction: (m['direction'] ?? 'incoming').toString(),
+    );
+  }
+}
+
+class _MessageBubble extends StatelessWidget {
+  final ChatMessage msg;
+  final VoidCallback? onLongPress;
+  final VoidCallback? onTapMedia;
+  final ChatMessage? Function(int id) findById; // NEW
+  final VoidCallback? onSwipeReply;             // NEW
+
+  const _MessageBubble({
+    super.key,
+    required this.msg,
+    this.onLongPress,
+    this.onTapMedia,
+    required this.findById,
+    this.onSwipeReply,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        mainAxisAlignment: msg.isOut ? MainAxisAlignment.end : MainAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (!msg.isOut) const SizedBox(width: 36),
+          GestureDetector(
+            onLongPress: onLongPress,
+            onHorizontalDragEnd: (details) {
+              if ((details.primaryVelocity ?? 0) > 150) { // swipe → reply
+                if (onSwipeReply != null) onSwipeReply!();
+              }
+            },
+            child: _buildBubbleWithGhosting(context),
+          ),
+          if (msg.isOut) const SizedBox(width: 36),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBubbleWithGhosting(BuildContext context) {
+    final ghost = (msg.existsOnTelegram == false) || (msg.status == MessageStatus.pending);
+    final base = _bubbleCore(context);
+
+    // text/call → overall opacity
+    if ((msg.mediaType ?? 'text') == 'text' || (msg.mediaType ?? '').startsWith('call_')) {
+      return Opacity(opacity: ghost ? 0.65 : 1.0, child: base);
+    }
+    return base; // image/file handled in body
+  }
+
+  Widget _bubbleCore(BuildContext context) {
+    final bubbleColor = msg.isOut ? Colors.blue.shade100 : Colors.grey.shade200;
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 320),
+      child: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(color: bubbleColor, borderRadius: BorderRadius.circular(12)),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (!msg.isOut && msg.senderName.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Text(msg.senderName, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+              ),
+            _buildBody(context),
+            const SizedBox(height: 6),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(_fmtTime(msg.date), style: const TextStyle(fontSize: 10, color: Colors.black54)),
+                const SizedBox(width: 6),
+                if (msg.status == MessageStatus.pending)
+                  const Icon(Icons.schedule, size: 12, color: Colors.black45)
+                else if (msg.status == MessageStatus.failed)
+                  const Icon(Icons.error_outline, size: 12, color: Colors.redAccent)
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBody(BuildContext context) {
+    final mt = (msg.mediaType ?? 'text');
+    final List<Widget> children = [];
+
+    // Reply preview (real content)
+    if (msg.replyTo != null) {
+      final ref = findById(msg.replyTo!);
+      children.add(_ReplyPreview(id: msg.replyTo!, text: ref?.previewText() ?? '', mediaType: ref?.mediaType ?? 'text'));
+    }
+
+    if (mt == 'text') {
+      final ghost = (msg.existsOnTelegram == false) || (msg.status == MessageStatus.pending);
+      if (msg.text.isNotEmpty) {
+        children.add(SelectableText(
+          msg.text,
+          style: TextStyle(
+            fontSize: 15,
+            fontStyle: ghost ? FontStyle.italic : FontStyle.normal,
+            color: ghost ? Colors.black54 : Colors.black87,
+          ),
+        ));
+      } else {
+        children.add(const Text('[empty]', style: TextStyle(fontSize: 15, fontStyle: FontStyle.italic)));
+      }
+    } else if (mt == 'image') {
+      final ghost = (msg.existsOnTelegram == false) || (msg.status == MessageStatus.pending);
+      if ((msg.mediaLink ?? '').isNotEmpty) {
+        Widget img = Image.network(
+          msg.mediaLink!,
+          fit: BoxFit.cover,
+          loadingBuilder: (context, child, progress) {
+            if (progress == null) return child;
+            final v = progress.expectedTotalBytes == null ? null : progress.cumulativeBytesLoaded / (progress.expectedTotalBytes!);
+            return SizedBox(height: 180, width: 240, child: Center(child: CircularProgressIndicator(value: v)));
+          },
+          errorBuilder: (_, __, ___) => Container(
+            color: Colors.black12,
+            height: 180,
+            width: 240,
+            alignment: Alignment.center,
+            child: const Icon(Icons.broken_image),
+          ),
+        );
+        if (ghost) {
+          img = Opacity(
+            opacity: 0.65,
+            child: const ColorFiltered(
+              colorFilter: ColorFilter.matrix(<double>[
+                0.2126, 0.7152, 0.0722, 0, 0,
+                0.2126, 0.7152, 0.0722, 0, 0,
+                0.2126, 0.7152, 0.0722, 0, 0,
+                0,      0,      0,      1, 0,
+              ]),
+              child: SizedBox.shrink(),
+            ),
+          );
+          // wrap real image inside ColorFiltered
+          img = Opacity(
+            opacity: 0.65,
+            child: ColorFiltered(
+              colorFilter: const ColorFilter.matrix(<double>[
+                0.2126, 0.7152, 0.0722, 0, 0,
+                0.2126, 0.7152, 0.0722, 0, 0,
+                0.2126, 0.7152, 0.0722, 0, 0,
+                0,      0,      0,      1, 0,
+              ]),
+              child: img,
+            ),
+          );
+        }
+        children.add(
+          GestureDetector(
+            onTap: onTapMedia,
+            child: ClipRRect(borderRadius: BorderRadius.circular(10), child: SizedBox(width: 240, child: img)),
+          ),
+        );
+      } else {
+        children.add(_uploadProgressBar());
+      }
+      if (msg.text.isNotEmpty) {
+        children.add(const SizedBox(height: 6));
+        children.add(Text(
+          msg.text,
+          style: TextStyle(
+            fontStyle: (msg.existsOnTelegram == false) ? FontStyle.italic : FontStyle.normal,
+            color: (msg.existsOnTelegram == false) ? Colors.black54 : null,
+          ),
+        ));
+      }
+    } else if (mt.startsWith('call_') && msg.call != null) {
+      children.add(_CallChip(call: msg.call!));
+    } else {
+      // generic file/video/audio/voice/sticker
+      children.add(
+        InkWell(
+          onTap: onTapMedia,
+          child: Row(children: [
+            const Icon(Icons.attach_file),
+            const SizedBox(width: 8),
+            Expanded(child: Text('[${mt}] tap to open', overflow: TextOverflow.ellipsis)),
+          ]),
+        ),
+      );
+      if (msg.text.isNotEmpty) {
+        children.add(const SizedBox(height: 6));
+        children.add(Text(msg.text));
+      }
+      if (msg.status == MessageStatus.pending) {
+        children.add(const SizedBox(height: 6));
+        children.add(_uploadProgressBar());
+      }
+    }
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: children);
+  }
+
+  Widget _uploadProgressBar() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        LinearProgressIndicator(value: (msg.uploadProgress > 0 && msg.uploadProgress <= 100) ? msg.uploadProgress / 100.0 : null),
+        const SizedBox(height: 4),
+        Text('${msg.uploadProgress.toStringAsFixed(1)}%'),
+      ],
+    );
+  }
+
+  String _fmtTime(DateTime dt) {
+    final h = dt.toLocal().hour.toString().padLeft(2, '0');
+    final m = dt.toLocal().minute.toString().padLeft(2, '0');
+    return '$h:$m';
+  }
+}
+
+class _ReplyPreview extends StatelessWidget {
+  final int id;
+  final String text;
+  final String mediaType;
+  const _ReplyPreview({required this.id, required this.text, required this.mediaType});
+
+  @override
+  Widget build(BuildContext context) {
+    final isText = mediaType == 'text';
+    final label = isText ? (text.isEmpty ? '[text]' : text) : '[${mediaType}]';
+    return Container(
+      padding: const EdgeInsets.all(8),
+      margin: const EdgeInsets.only(bottom: 6),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.6),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.black12),
+      ),
+      child: Row(children: [
+        const Icon(Icons.subdirectory_arrow_right, size: 16, color: Colors.black54),
+        const SizedBox(width: 6),
+        Expanded(child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12, color: Colors.black87))),
+        const SizedBox(width: 6),
+        Text('#$id', style: const TextStyle(fontSize: 11, color: Colors.black45)),
+      ]),
+    );
+  }
+}
+
+class _CallChip extends StatelessWidget {
+  final CallInfo call;
+  const _CallChip({required this.call});
+
+  @override
+  Widget build(BuildContext context) {
+    final isVideo = call.isVideo;
+    final icon = isVideo ? Icons.videocam : Icons.call;
+    final dur = call.duration != null ? _fmt(call.duration!) : null;
+    final text = StringBuffer()..write(call.direction)..write(' ')..write(call.status);
+    if (dur != null) text.write(' • $dur');
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.7),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.black12),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(icon, size: 18),
+        const SizedBox(width: 8),
+        Text(text.toString()),
+      ]),
+    );
+  }
+
+  String _fmt(int s) {
+    final m = (s ~/ 60).toString().padLeft(2, '0');
+    final ss = (s % 60).toString().padLeft(2, '0');
+    return '$m:$ss';
+  }
+}
