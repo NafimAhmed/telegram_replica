@@ -1464,29 +1464,116 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Widget _buildComposer() {
+    final canSend = _textCtrl.text.trim().isNotEmpty && !_sending;
+
     return SafeArea(
       top: false,
-      child: Padding(
+      child: Container(
+        color: const Color(0xFFF7F7F7), // Telegram-like bottom bar
         padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
         child: Row(
           children: [
-            IconButton(tooltip: 'Image', onPressed: _sendImage, icon: const Icon(Icons.image)),
+            // Telegram-style attach (paperclip). Still calls _sendImage().
+            IconButton(
+              tooltip: 'Attach',
+              onPressed: _sendImage,
+              icon: const Icon(Icons.attach_file),
+            ),
+
+            // Rounded, filled input like Telegram
             Expanded(
               child: TextField(
-                controller: _textCtrl,
-                minLines: 1,
-                maxLines: 5,
-                onChanged: (_) => _sendTypingStart(),
-                decoration: const InputDecoration(hintText: 'Message', isDense: true, border: OutlineInputBorder()),
+              controller: _textCtrl,
+              minLines: 1,
+              maxLines: 4,
+              onChanged: (_) => _sendTypingStart(),
+              decoration: const InputDecoration(hintText: 'Message', isDense: true, border: OutlineInputBorder()),
+            ),
+
+              // Container(
+              //   decoration: BoxDecoration(
+              //     color: Colors.white,
+              //     borderRadius: BorderRadius.circular(24),
+              //     boxShadow: const [
+              //       BoxShadow(color: Colors.black12, blurRadius: 1, offset: Offset(0, 1)),
+              //     ],
+              //   ),
+              //   padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
+              //   child: TextField(
+              //     controller: _textCtrl,
+              //     minLines: 1,
+              //     maxLines: 5,
+              //     onChanged: (_) {
+              //       _sendTypingStart();
+              //       // update send button enabled/disabled instantly
+              //       if (mounted) setState(() {});
+              //     },
+              //     style: const TextStyle(fontSize: 16),
+              //     decoration: const InputDecoration(
+              //       hintText: 'Message',
+              //       isCollapsed: true,
+              //       border: InputBorder.none,
+              //     ),
+              //   ),
+              // ),
+            ),
+
+            const SizedBox(width: 8),
+
+            // Telegram-style circular Send button
+            SizedBox(
+              width: 40,
+              height: 40,
+              child: Material(
+                color: canSend ? const Color(0xFF2AABEE) : const Color(0xFFB3E5FC),
+                shape: const CircleBorder(),
+                child: InkWell(
+                  customBorder: const CircleBorder(),
+                  onTap: canSend ? _sendText : null,
+                  child: Center(
+                    child: _sending
+                        ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(Colors.white)),
+                    )
+                        :  IconButton(onPressed: _sending ? null : _sendText, icon: const Icon(Icons.send)),
+                  ),
+                ),
               ),
             ),
-            const SizedBox(width: 8),
-            IconButton(onPressed: _sending ? null : _sendText, icon: const Icon(Icons.send)),
           ],
         ),
       ),
     );
   }
+
+
+// Widget _buildComposer() {
+  //   return SafeArea(
+  //     top: false,
+  //     child:
+  //     Padding(
+  //       padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+  //       child: Row(
+  //         children: [
+  //           IconButton(tooltip: 'Image', onPressed: _sendImage, icon: const Icon(Icons.image)),
+  //           Expanded(
+  //             child: TextField(
+  //               controller: _textCtrl,
+  //               minLines: 1,
+  //               maxLines: 5,
+  //               onChanged: (_) => _sendTypingStart(),
+  //               decoration: const InputDecoration(hintText: 'Message', isDense: true, border: OutlineInputBorder()),
+  //             ),
+  //           ),
+  //           const SizedBox(width: 8),
+  //           IconButton(onPressed: _sending ? null : _sendText, icon: const Icon(Icons.send)),
+  //         ],
+  //       ),
+  //     ),
+  //   );
+  // }
 }
 
 DateTime _parseIso(dynamic v) {
