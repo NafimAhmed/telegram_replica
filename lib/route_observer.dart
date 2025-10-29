@@ -1,4 +1,6 @@
-import 'package:flutter/widgets.dart';
+import 'package:flutter/material.dart';
 
-final RouteObserver<PageRoute<dynamic>> routeObserver =
-RouteObserver<PageRoute<dynamic>>();
+/// Use this with MaterialApp.navigatorObservers: [routeObserver]
+final RouteObserver<ModalRoute<void>> routeObserver =
+RouteObserver<ModalRoute<void>>();
+

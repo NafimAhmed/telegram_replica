@@ -5,6 +5,7 @@ import 'package:ag_taligram/providers/telegraph_qg_provider.dart';
 import 'package:ag_taligram/screens/auth_screen/phone_login_screen.dart';
 import 'package:ag_taligram/screens/chant.dart';
 import 'package:ag_taligram/screens/chat_screen.dart';
+import 'package:ag_taligram/screens/group_add_screen.dart';
 import 'package:ag_taligram/screens/search_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -169,6 +170,7 @@ class _TelegraphHomeState extends State<TelegraphHome>
             onTap: () {
               final chatIdValue = d["id"];
               final accessHash = d["access_hash"];
+              final isGroup = d["is_group"] == true;
               if (chatIdValue == null) {
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(
@@ -189,9 +191,14 @@ class _TelegraphHomeState extends State<TelegraphHome>
                         : int.tryParse(chatIdValue.toString()) ?? 0,
                     name: d["name"],
                     username: d["username"],
-                      accessHash:accessHash is int
-                          ? accessHash
-                          : int.tryParse(accessHash.toString()) ?? 0,
+                    accessHash: isGroup
+                        ? null // ✅ যদি group হয়, তাহলে null যাবে
+                        : (accessHash is int
+                        ? accessHash
+                        : int.tryParse(accessHash.toString()) ?? 0),
+                      // accessHash:accessHash is int
+                      //     ? accessHash
+                      //     : int.tryParse(accessHash.toString()) ?? 0,
                   ),
                 ),
               );
@@ -441,14 +448,42 @@ class _TelegraphDrawerState extends State<TelegraphDrawer> {
 
                 // BODY MENU
                 Expanded(
-                  child: ListView(children: const [
+                  child: ListView(children:  [
                     ListTile(leading: Icon(Icons.person), title: Text("My Profile")),
                     ListTile(
                         leading: Icon(Icons.star_border),
                         title: Text("Special Features")),
                     ListTile(
-                        leading: Icon(Icons.chat_bubble_outline),
-                        title: Text("New Chat")),
+                      leading: const Icon(Icons.chat_bubble_outline),
+                      title: const Text("New Chat"),
+                      onTap: () {
+                        final p = Provider.of<TelegraphProvider>(context, listen: false);
+
+                        // ensure + prefix
+                        final activePhone = p.phoneNumber.startsWith('+')
+                            ? p.phoneNumber
+                            : '+${p.phoneNumber}';
+
+                        if (activePhone.isEmpty) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('No active account phone')),
+                          );
+                          return;
+                        }
+
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) => CreateGropu(phoneNumber: activePhone),
+                          ),
+                        );
+                      },
+                    ),
+
+                    // ListTile(
+                    //     leading: Icon(Icons.chat_bubble_outline),
+                    //     title: Text("New Chat"),
+                    //
+                    // ),
                     Divider(),
                     ListTile(leading: Icon(Icons.contacts), title: Text("Contacts")),
                     ListTile(leading: Icon(Icons.call), title: Text("Calls")),

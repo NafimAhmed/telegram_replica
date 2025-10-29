@@ -286,7 +286,7 @@ class TelegraphProvider with ChangeNotifier {
   Future<void> fetchMessages(String phone, int chatId, int accessHash) async {
     try {
       final url = Uri.parse(
-          "$baseUrl/messages?phone=$phone&chat_id=$chatId&access_hash=$accessHash");
+          "$baseUrl/messages?phone=+$phone&chat_id=$chatId&access_hash=$accessHash");
       print("📥 Fetching → $url");
 
       final res = await http.get(url);

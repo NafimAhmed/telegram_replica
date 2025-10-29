@@ -188,6 +188,7 @@
 // }
 
 import 'dart:convert';
+import 'package:ag_taligram/providers/chat_history_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -210,6 +211,7 @@ void main() async {
     MultiProvider(
       providers: [
         ChangeNotifierProvider(create: (_) => TelegraphProvider()),
+        ChangeNotifierProvider(create: (_) => ChatHistoryProvider()),
       ],
       child: TelegramApp(
         startScreen:
