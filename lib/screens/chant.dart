@@ -970,7 +970,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final Map<String, ChatMessage> _byTemp = {};
 
   // Stable ordering sequence
-  int _seqCounter = 0; // 👈 NEW: increases on first insert of any message
+  int _seqCounter = 0; // increases on first insert of any message
 
   // ===== URL helpers =====
   String get _wsUrl {
@@ -1006,6 +1006,29 @@ class _ChatScreenState extends State<ChatScreen> {
       query: uri.query,
     );
     return newUri.toString();
+  }
+
+  // Fallback media URL builder (uses your API base, phone/chat/msg/access_hash)
+  String _buildMediaUrl(int msgId) {
+    final api = Uri.parse(urlLocal.trim());
+    final path = api.path.endsWith('/')
+        ? '${api.path}message_media'
+        : '${api.path}/message_media';
+
+    final qp = <String, String>{
+      'phone': widget.phone,
+      'chat_id': widget.chatId.toString(),
+      'msg_id': msgId.toString(),
+      if (widget.accessHash != null) 'access_hash': widget.accessHash.toString(),
+    };
+
+    return Uri(
+      scheme: api.scheme,
+      host: api.host,
+      port: api.hasPort ? api.port : null,
+      path: path,
+      queryParameters: qp,
+    ).toString();
   }
 
   @override
@@ -1151,7 +1174,7 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() {});
         break;
 
-      case 'send_queued':
+      case 'send_queued': {
         final tempId = m['temp_id']?.toString() ?? _makeTempId();
         final msg = ChatMessage(
           id: null,
@@ -1175,8 +1198,9 @@ class _ChatScreenState extends State<ChatScreen> {
         _scrollToBottom();
         setState(() {});
         break;
+      }
 
-      case 'upload_progress':
+      case 'upload_progress': {
         final tempId = m['temp_id']?.toString();
         final p = (m['progress'] is num) ? (m['progress'] as num).toDouble() : null;
         if (tempId != null && p != null) {
@@ -1187,25 +1211,51 @@ class _ChatScreenState extends State<ChatScreen> {
           }
         }
         break;
+      }
 
-      case 'send_done':
+      case 'send_done': {
         final tempId = m['temp_id']?.toString();
         final rawId = m['msg_id'];
         final msgId = (rawId is int) ? rawId : int.tryParse(rawId?.toString() ?? '');
+
         if (tempId != null && msgId != null) {
           final item = _byTemp[tempId];
           if (item != null) {
+            // media_type: prefer server, else keep previous
+            final typ = (m['media_type'] ?? item.mediaType)?.toString();
+
+            // media_link: server → rewrite; else build fallback for non-text
+            String? link;
+            final rawLink = m['media_link']?.toString();
+            if (rawLink != null && rawLink.isNotEmpty) {
+              link = rewriteMediaLink(rawLink);
+            } else if (typ != null && typ != 'text') {
+              link = _buildMediaUrl(msgId);
+            }
+
+            // optional server date
+            final maybeDate = _parseIso(m['date']);
+
             item.id = msgId;
+            item.mediaType = typ ?? item.mediaType;
+            if (link != null) item.mediaLink = link;
+            if (maybeDate != null) item.date = maybeDate;
             item.existsOnTelegram = true;
             item.status = MessageStatus.sent;
+            item.uploadProgress = 100.0;
+
+            // promote to byId, drop temp
             _byId[msgId] = item;
+            _byTemp.remove(tempId);
+
             _sortMessages();
             setState(() {});
           }
         }
         break;
+      }
 
-      case 'send_failed':
+      case 'send_failed': {
         final tempId2 = m['temp_id']?.toString();
         if (tempId2 != null) {
           final item = _byTemp[tempId2];
@@ -1216,8 +1266,9 @@ class _ChatScreenState extends State<ChatScreen> {
           }
         }
         break;
+      }
 
-      case 'typing':
+      case 'typing': {
         final sender = (m['sender_id'] is int) ? m['sender_id'] as int : null;
         if (sender != null) {
           _typingUserIds.add(sender);
@@ -1225,8 +1276,9 @@ class _ChatScreenState extends State<ChatScreen> {
           setState(() {});
         }
         break;
+      }
 
-      case 'typing_stopped':
+      case 'typing_stopped': {
         final sender2 = (m['sender_id'] is int) ? m['sender_id'] as int : null;
         if (sender2 != null) {
           _typingUserIds.remove(sender2);
@@ -1234,13 +1286,13 @@ class _ChatScreenState extends State<ChatScreen> {
           setState(() {});
         }
         break;
+      }
 
       case '_hb':
-      // ignore
         break;
 
       default:
-      // ignore
+      // ignore unknown
     }
   }
 
@@ -1261,12 +1313,18 @@ class _ChatScreenState extends State<ChatScreen> {
   void _insertOrUpdate(ChatMessage msg) {
     msg.mediaLink = rewriteMediaLink(msg.mediaLink);
 
+    // 🔧 NEW: if non-text and link missing, build fallback URL when we have msg.id
+    if ((msg.mediaType ?? 'text') != 'text' &&
+        (msg.mediaLink == null || msg.mediaLink!.isEmpty) &&
+        msg.id != null) {
+      msg.mediaLink = _buildMediaUrl(msg.id!);
+    }
+
     if (msg.id != null) {
       final existing = _byId[msg.id!];
       if (existing != null) {
         existing.mergeFrom(msg);
       } else {
-        // first insert of a real message
         if (msg.arriveSeq < 0) msg.arriveSeq = _seqCounter++;
         _byId[msg.id!] = msg;
         _messages.add(msg);
@@ -1276,13 +1334,11 @@ class _ChatScreenState extends State<ChatScreen> {
       if (existing != null) {
         existing.mergeFrom(msg);
       } else {
-        // first insert of a pending message
         if (msg.arriveSeq < 0) msg.arriveSeq = _seqCounter++;
         _byTemp[msg.tempId!] = msg;
         _messages.add(msg);
       }
     } else {
-      // no id/tempId → still keep stable
       if (msg.arriveSeq < 0) msg.arriveSeq = _seqCounter++;
       _messages.add(msg);
     }
@@ -1480,8 +1536,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(widget.name, style: const TextStyle(fontWeight: FontWeight.w600)),
-                //  Text(_subtitleText(), style: theme.textTheme.bodySmall),
-                  Text(_subtitleText(), style: TextStyle(color: Colors.white,fontSize: 12)),
+                  // Text(_subtitleText(), style: theme.textTheme.bodySmall),
+                  Text(_subtitleText(), style: const TextStyle(color: Colors.white, fontSize: 12)),
                 ],
               ),
             ),
@@ -1583,7 +1639,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 minLines: 1,
                 maxLines: 4,
                 onChanged: (_) {
-               //   _sendTypingStart();
+                  // _sendTypingStart();
                   if (mounted) setState(() {}); // update send button state immediately
                 },
                 decoration: const InputDecoration(
@@ -1654,7 +1710,7 @@ class ChatMessage {
   double uploadProgress; // 0..100 for pending file uploads
   MessageStatus status;
 
-  // NEW: stable ordering fallback
+  // stable ordering fallback
   int arriveSeq;
 
   ChatMessage({
@@ -1676,9 +1732,15 @@ class ChatMessage {
     this.arriveSeq = -1,
   });
 
+  // >>> FIXED: normalize msg_id/photo and keep link if provided
   factory ChatMessage.fromJson(Map<String, dynamic> m) {
+    final anyId = m['id'] ?? m['msg_id'];
+
+    String? t = m['media_type']?.toString();
+    if (t == 'photo') t = 'image'; // normalize
+
     return ChatMessage(
-      id: (m['id'] is int) ? m['id'] as int : int.tryParse(m['id']?.toString() ?? ''),
+      id: (anyId is int) ? anyId : int.tryParse(anyId?.toString() ?? ''),
       tempId: m['temp_id']?.toString(),
       text: (m['text'] ?? '').toString(),
       senderId: (m['sender_id'] is int) ? m['sender_id'] as int : null,
@@ -1686,11 +1748,10 @@ class ChatMessage {
       date: _parseIso(m['date']),
       isOut: (m['is_out'] == true),
       replyTo: (m['reply_to'] is int) ? m['reply_to'] as int : null,
-      mediaType: m['media_type']?.toString(),
+      mediaType: t,
       mediaLink: m['media_link']?.toString(),
       call: (m['call'] is Map) ? CallInfo.fromJson(m['call'] as Map<String, dynamic>) : null,
       deletedOnTelegram: m['deleted_on_telegram'] == true,
-      // default true unless explicitly false
       existsOnTelegram: m['exists_on_telegram'] != false,
       uploadProgress: 0.0,
       status: MessageStatus.sent,
@@ -1699,7 +1760,6 @@ class ChatMessage {
   }
 
   void mergeFrom(ChatMessage other) {
-    // Keep existing arriveSeq to preserve stable order.
     id = other.id ?? id;
     tempId = other.tempId ?? tempId;
     text = other.text.isNotEmpty ? other.text : text;
@@ -1869,6 +1929,7 @@ class _MessageBubble extends StatelessWidget {
         Widget img = Image.network(
           msg.mediaLink!,
           fit: BoxFit.cover,
+          gaplessPlayback: true, // reduce flicker when URL updates
           loadingBuilder: (context, child, progress) {
             if (progress == null) return child;
             final v = progress.expectedTotalBytes == null
@@ -1876,28 +1937,41 @@ class _MessageBubble extends StatelessWidget {
                 : progress.cumulativeBytesLoaded / (progress.expectedTotalBytes!);
             return SizedBox(height: 180, width: 240, child: Center(child: CircularProgressIndicator(value: v)));
           },
-          errorBuilder: (_, __, ___) => Container(
-            color: Colors.black12,
-            height: 180,
-            width: 240,
-            alignment: Alignment.center,
-            child: const Icon(Icons.broken_image),
-          ),
+          // errorBuilder: (_, __, ___) => Container(
+          //   color: Colors.black12,
+          //   height: 180,
+          //   width: 240,
+          //   alignment: Alignment.center,
+          //   child: const Icon(Icons.broken_image),
+          // ),
         );
         if (ghost) {
           img = Opacity(
-            opacity: 0.65,
+            opacity: 0.85,
             child: ColorFiltered(
-              colorFilter: const ColorFilter.matrix(<double>[
-                0.2126, 0.7152, 0.0722, 0, 0,
-                0.2126, 0.7152, 0.0722, 0, 0,
-                0.2126, 0.7152, 0.0722, 0, 0,
-                0,      0,      0,      1, 0,
-              ]),
+              colorFilter: ColorFilter.mode(
+                Colors.red.withOpacity(0.50), // ফ্যাকাশে লাল
+                BlendMode.modulate,           // ইমেজের সাথে গুণ হয়ে টিন্ট দেয়
+              ),
               child: img,
             ),
           );
         }
+
+        // if (ghost) {
+        //   img = Opacity(
+        //     opacity: 0.65,
+        //     child: ColorFiltered(
+        //       colorFilter: const ColorFilter.matrix(<double>[
+        //         0.2126, 0.7152, 0.0722, 0, 0,
+        //         0.2126, 0.7152, 0.0722, 0, 0,
+        //         0.2126, 0.7152, 0.0722, 0, 0,
+        //         0,      0,      0,      1, 0,
+        //       ]),
+        //       child: img,
+        //     ),
+        //   );
+        // }
         children.add(
           GestureDetector(
             onTap: onTapMedia,
@@ -1951,9 +2025,10 @@ class _MessageBubble extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         LinearProgressIndicator(
-            value: (msg.uploadProgress > 0 && msg.uploadProgress <= 100)
-                ? msg.uploadProgress / 100.0
-                : null),
+          value: (msg.uploadProgress > 0 && msg.uploadProgress <= 100)
+              ? msg.uploadProgress / 100.0
+              : null,
+        ),
         const SizedBox(height: 4),
         Text('${msg.uploadProgress.toStringAsFixed(1)}%'),
       ],
@@ -2032,7 +2107,6 @@ class _CallChip extends StatelessWidget {
 
 
 
-//
 // import 'dart:async';
 // import 'dart:convert';
 // import 'dart:io';
@@ -2096,6 +2170,9 @@ class _CallChip extends StatelessWidget {
 //   final Map<int, ChatMessage> _byId = {};
 //   final Map<String, ChatMessage> _byTemp = {};
 //
+//   // Stable ordering sequence
+//   int _seqCounter = 0; // 👈 NEW: increases on first insert of any message
+//
 //   // ===== URL helpers =====
 //   String get _wsUrl {
 //     final base = urlLocal.trim();
@@ -2103,7 +2180,12 @@ class _CallChip extends StatelessWidget {
 //     final isHttps = uri.scheme == 'https';
 //     final scheme = isHttps ? 'wss' : 'ws';
 //     final path = uri.path.endsWith('/') ? '${uri.path}chat_ws' : '${uri.path}/chat_ws';
-//     final wsUri = Uri(scheme: scheme, host: uri.host, port: uri.hasPort ? uri.port : null, path: path);
+//     final wsUri = Uri(
+//       scheme: scheme,
+//       host: uri.host,
+//       port: uri.hasPort ? uri.port : null,
+//       path: path,
+//     );
 //     return wsUri.toString();
 //   }
 //
@@ -2111,7 +2193,11 @@ class _CallChip extends StatelessWidget {
 //     if (link == null || link.isEmpty) return '';
 //     final api = Uri.parse(urlLocal);
 //     Uri uri;
-//     try { uri = Uri.parse(link); } catch (_) { return link; }
+//     try {
+//       uri = Uri.parse(link);
+//     } catch (_) {
+//       return link;
+//     }
 //
 //     final newUri = Uri(
 //       scheme: api.scheme,
@@ -2147,7 +2233,9 @@ class _CallChip extends StatelessWidget {
 //     _manuallyClosed = false;
 //
 //     try {
-//       setState(() { _listening = false; });
+//       setState(() {
+//         _listening = false;
+//       });
 //       _ws = await WebSocket.connect(_wsUrl);
 //       _reconnectAttempt = 0;
 //
@@ -2172,7 +2260,9 @@ class _CallChip extends StatelessWidget {
 //         },
 //         cancelOnError: true,
 //         onDone: _onSocketDone,
-//         onError: (err) { _onSocketDone(); },
+//         onError: (err) {
+//           _onSocketDone();
+//         },
 //       );
 //     } catch (e) {
 //       _scheduleReconnect();
@@ -2201,7 +2291,7 @@ class _CallChip extends StatelessWidget {
 //   void _startPing() {
 //     _pingTimer?.cancel();
 //     _pingTimer = Timer.periodic(const Duration(seconds: 25), (_) {
-//       _send({ 'action': 'ping' });
+//       _send({'action': 'ping'});
 //     });
 //   }
 //
@@ -2222,11 +2312,17 @@ class _CallChip extends StatelessWidget {
 //
 //   void _handleFrameString(String s) {
 //     Map<String, dynamic> m;
-//     try { m = json.decode(s) as Map<String, dynamic>; } catch (_) { return; }
+//     try {
+//       m = json.decode(s) as Map<String, dynamic>;
+//     } catch (_) {
+//       return;
+//     }
 //
 //     // Status frames
 //     if (m['status'] == 'listening') {
-//       setState(() { _listening = true; });
+//       setState(() {
+//         _listening = true;
+//       });
 //       return;
 //     }
 //     if (m['status'] == 'pong') return;
@@ -2248,12 +2344,14 @@ class _CallChip extends StatelessWidget {
 //         _scrollToBottom();
 //         setState(() {});
 //         break;
+//
 //       case 'new_message':
 //         final msg = ChatMessage.fromJson(m);
 //         _insertOrUpdate(msg);
 //         _scrollAfterIncoming();
 //         setState(() {});
 //         break;
+//
 //       case 'send_queued':
 //         final tempId = m['temp_id']?.toString() ?? _makeTempId();
 //         final msg = ChatMessage(
@@ -2264,7 +2362,7 @@ class _CallChip extends StatelessWidget {
 //           isOut: true,
 //           senderId: null,
 //           senderName: widget.username,
-//           replyTo: null,
+//           replyTo: (m['reply_to'] is int) ? m['reply_to'] as int : null,
 //           mediaType: (m['media_type'] ?? 'text').toString(),
 //           mediaLink: null,
 //           call: null,
@@ -2272,41 +2370,54 @@ class _CallChip extends StatelessWidget {
 //           existsOnTelegram: false,
 //           uploadProgress: 0.0,
 //           status: MessageStatus.pending,
+//           arriveSeq: -1,
 //         );
-//         _messages.add(msg);
-//         _byTemp[tempId] = msg;
+//         _insertOrUpdate(msg);
 //         _scrollToBottom();
 //         setState(() {});
 //         break;
+//
 //       case 'upload_progress':
 //         final tempId = m['temp_id']?.toString();
 //         final p = (m['progress'] is num) ? (m['progress'] as num).toDouble() : null;
 //         if (tempId != null && p != null) {
 //           final item = _byTemp[tempId];
-//           if (item != null) { item.uploadProgress = p; setState(() {}); }
+//           if (item != null) {
+//             item.uploadProgress = p;
+//             setState(() {});
+//           }
 //         }
 //         break;
+//
 //       case 'send_done':
 //         final tempId = m['temp_id']?.toString();
-//         final msgId = m['msg_id'];
-//         if (tempId != null && msgId is int) {
+//         final rawId = m['msg_id'];
+//         final msgId = (rawId is int) ? rawId : int.tryParse(rawId?.toString() ?? '');
+//         if (tempId != null && msgId != null) {
 //           final item = _byTemp[tempId];
 //           if (item != null) {
 //             item.id = msgId;
 //             item.existsOnTelegram = true;
 //             item.status = MessageStatus.sent;
 //             _byId[msgId] = item;
+//             _sortMessages();
 //             setState(() {});
 //           }
 //         }
 //         break;
+//
 //       case 'send_failed':
-//         final tempId = m['temp_id']?.toString();
-//         if (tempId != null) {
-//           final item = _byTemp[tempId];
-//           if (item != null) { item.status = MessageStatus.failed; setState(() {}); _showSnack('Send failed: ${m['detail'] ?? ''}'); }
+//         final tempId2 = m['temp_id']?.toString();
+//         if (tempId2 != null) {
+//           final item = _byTemp[tempId2];
+//           if (item != null) {
+//             item.status = MessageStatus.failed;
+//             setState(() {});
+//             _showSnack('Send failed: ${m['detail'] ?? ''}');
+//           }
 //         }
 //         break;
+//
 //       case 'typing':
 //         final sender = (m['sender_id'] is int) ? m['sender_id'] as int : null;
 //         if (sender != null) {
@@ -2315,19 +2426,37 @@ class _CallChip extends StatelessWidget {
 //           setState(() {});
 //         }
 //         break;
+//
 //       case 'typing_stopped':
-//         final sender = (m['sender_id'] is int) ? m['sender_id'] as int : null;
-//         if (sender != null) {
-//           _typingUserIds.remove(sender);
-//           _typingTtl.remove(sender);
+//         final sender2 = (m['sender_id'] is int) ? m['sender_id'] as int : null;
+//         if (sender2 != null) {
+//           _typingUserIds.remove(sender2);
+//           _typingTtl.remove(sender2);
 //           setState(() {});
 //         }
 //         break;
+//
 //       case '_hb':
+//       // ignore
 //         break;
+//
 //       default:
 //       // ignore
 //     }
+//   }
+//
+//   // ===== Stable ordering =====
+//   void _sortMessages() {
+//     _messages.sort((a, b) {
+//       // 1) If both have msg_id → msg_id ascending (true Telegram order)
+//       if (a.id != null && b.id != null) {
+//         return a.id!.compareTo(b.id!);
+//       }
+//       // 2) Otherwise date, then arrival sequence (stable)
+//       final c = a.date.compareTo(b.date);
+//       if (c != 0) return c;
+//       return a.arriveSeq.compareTo(b.arriveSeq);
+//     });
 //   }
 //
 //   void _insertOrUpdate(ChatMessage msg) {
@@ -2338,6 +2467,8 @@ class _CallChip extends StatelessWidget {
 //       if (existing != null) {
 //         existing.mergeFrom(msg);
 //       } else {
+//         // first insert of a real message
+//         if (msg.arriveSeq < 0) msg.arriveSeq = _seqCounter++;
 //         _byId[msg.id!] = msg;
 //         _messages.add(msg);
 //       }
@@ -2346,13 +2477,18 @@ class _CallChip extends StatelessWidget {
 //       if (existing != null) {
 //         existing.mergeFrom(msg);
 //       } else {
+//         // first insert of a pending message
+//         if (msg.arriveSeq < 0) msg.arriveSeq = _seqCounter++;
 //         _byTemp[msg.tempId!] = msg;
 //         _messages.add(msg);
 //       }
 //     } else {
+//       // no id/tempId → still keep stable
+//       if (msg.arriveSeq < 0) msg.arriveSeq = _seqCounter++;
 //       _messages.add(msg);
 //     }
-//     _messages.sort((a, b) => a.date.compareTo(b.date));
+//
+//     _sortMessages();
 //   }
 //
 //   void _scrollToBottom() {
@@ -2368,8 +2504,10 @@ class _CallChip extends StatelessWidget {
 //
 //   void _scrollAfterIncoming() {
 //     if (!_scrollCtrl.hasClients) return;
-//     final atBottom = _scrollCtrl.position.pixels >= _scrollCtrl.position.maxScrollExtent - 120;
-//     if (atBottom) _scrollToBottom();
+//     final delta = _scrollCtrl.position.maxScrollExtent - _scrollCtrl.position.pixels;
+//     if (delta <= 200) {
+//       _scrollToBottom();
+//     }
 //   }
 //
 //   void _showSnack(String msg) {
@@ -2380,15 +2518,23 @@ class _CallChip extends StatelessWidget {
 //   void _send(Map<String, dynamic> payload) {
 //     final w = _ws;
 //     if (w == null) return;
-//     try { w.add(json.encode(payload)); } catch (_) {}
+//     try {
+//       w.add(json.encode(payload));
+//     } catch (_) {}
 //   }
 //
 //   // ===== helpers for reply/copy =====
 //   ChatMessage? _findById(int id) => _byId[id];
 //
 //   void _onReply(ChatMessage m) {
-//     if (m.id == null) { _showSnack('Reply needs a real msg_id'); return; }
-//     setState(() { _replyToMsgId = m.id; _replyPreviewText = m.previewText(); });
+//     if (m.id == null) {
+//       _showSnack('Reply needs a real msg_id');
+//       return;
+//     }
+//     setState(() {
+//       _replyToMsgId = m.id;
+//       _replyPreviewText = m.previewText();
+//     });
 //   }
 //
 //   Future<void> _copyText(String t) async {
@@ -2411,21 +2557,30 @@ class _CallChip extends StatelessWidget {
 //           ListTile(
 //             leading: const Icon(Icons.reply),
 //             title: const Text('Reply'),
-//             onTap: () { Navigator.pop(context); _onReply(m); },
+//             onTap: () {
+//               Navigator.pop(context);
+//               _onReply(m);
+//             },
 //           ),
 //         ];
 //         if ((m.text).trim().isNotEmpty) {
 //           items.add(ListTile(
 //             leading: const Icon(Icons.copy),
 //             title: const Text('Copy text'),
-//             onTap: () { Navigator.pop(context); _copyText(m.text); },
+//             onTap: () {
+//               Navigator.pop(context);
+//               _copyText(m.text);
+//             },
 //           ));
 //         }
 //         if ((m.mediaLink ?? '').isNotEmpty) {
 //           items.add(ListTile(
 //             leading: const Icon(Icons.link),
 //             title: const Text('Copy media link'),
-//             onTap: () { Navigator.pop(context); _copyLink(m.mediaLink!); },
+//             onTap: () {
+//               Navigator.pop(context);
+//               _copyLink(m.mediaLink!);
+//             },
 //           ));
 //         }
 //         return SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: items));
@@ -2437,7 +2592,7 @@ class _CallChip extends StatelessWidget {
 //   void _sendTypingStart() {
 //     _typingDebounce?.cancel();
 //     _typingDebounce = Timer(const Duration(milliseconds: 200), () {
-//       _send({ 'action': 'typing_start' });
+//       _send({'action': 'typing_start'});
 //     });
 //   }
 //
@@ -2446,7 +2601,9 @@ class _CallChip extends StatelessWidget {
 //     final text = _textCtrl.text.trim();
 //     if (text.isEmpty) return;
 //
-//     setState(() { _sending = true; });
+//     setState(() {
+//       _sending = true;
+//     });
 //
 //     final payload = <String, dynamic>{
 //       'action': 'send',
@@ -2457,7 +2614,9 @@ class _CallChip extends StatelessWidget {
 //
 //     _textCtrl.clear();
 //     _clearReply();
-//     setState(() { _sending = false; });
+//     setState(() {
+//       _sending = false;
+//     });
 //   }
 //
 //   Future<void> _sendImage() async {
@@ -2482,22 +2641,39 @@ class _CallChip extends StatelessWidget {
 //   }
 //
 //   void _clearReply() {
-//     setState(() { _replyToMsgId = null; _replyPreviewText = null; });
+//     setState(() {
+//       _replyToMsgId = null;
+//       _replyPreviewText = null;
+//     });
 //   }
 //
-//   String _makeTempId() => 'local-${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(1<<32)}';
+//   String _makeTempId() => 'local-${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(1 << 32)}';
+//
+//   String _subtitleText() {
+//     if (!_listening) return 'connecting…';
+//     if (!_seedArrived) return 'loading history…';
+//     if (_typingUserIds.isNotEmpty) return 'typing…';
+//     return 'online';
+//   }
+//
+//   String _initial(String s) {
+//     final t = s.trim();
+//     return t.isEmpty ? 'U' : t.substring(0, 1).toUpperCase();
+//   }
 //
 //   // ===== UI =====
 //   @override
 //   Widget build(BuildContext context) {
 //     final theme = Theme.of(context);
 //
+//     final canSend = _textCtrl.text.trim().isNotEmpty && !_sending;
+//
 //     return Scaffold(
 //       appBar: AppBar(
 //         titleSpacing: 0,
 //         title: Row(
 //           children: [
-//             CircleAvatar(child: Text(widget.name.isNotEmpty ? widget.name.characters.first : 'U')),
+//             CircleAvatar(child: Text(_initial(widget.name))),
 //             const SizedBox(width: 8),
 //             Expanded(
 //               child: Column(
@@ -2505,7 +2681,8 @@ class _CallChip extends StatelessWidget {
 //                 mainAxisSize: MainAxisSize.min,
 //                 children: [
 //                   Text(widget.name, style: const TextStyle(fontWeight: FontWeight.w600)),
-//                   Text(_subtitleText(), style: theme.textTheme.bodySmall),
+//                 //  Text(_subtitleText(), style: theme.textTheme.bodySmall),
+//                   Text(_subtitleText(), style: TextStyle(color: Colors.white,fontSize: 12)),
 //                 ],
 //               ),
 //             ),
@@ -2514,7 +2691,10 @@ class _CallChip extends StatelessWidget {
 //         actions: [
 //           IconButton(
 //             icon: const Icon(Icons.refresh),
-//             onPressed: () { _ws?.close(); _connect(); },
+//             onPressed: () {
+//               _ws?.close();
+//               _connect();
+//             },
 //           ),
 //         ],
 //       ),
@@ -2527,7 +2707,9 @@ class _CallChip extends StatelessWidget {
 //               padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 10),
 //               itemCount: _messages.length + 1,
 //               itemBuilder: (_, i) {
-//                 if (i == _messages.length) { return _buildTypingRow(); }
+//                 if (i == _messages.length) {
+//                   return _buildTypingRow();
+//                 }
 //                 final m = _messages[i];
 //                 return _MessageBubble(
 //                   key: ValueKey('msg-${m.id ?? m.tempId ?? i}'),
@@ -2536,25 +2718,21 @@ class _CallChip extends StatelessWidget {
 //                   onSwipeReply: () => _onReply(m),
 //                   onLongPress: () => _showMsgMenu(m),
 //                   onTapMedia: () async {
-//                     final url = m.mediaLink; if (url == null || url.isEmpty) return;
+//                     final url = m.mediaLink;
+//                     if (url == null || url.isEmpty) return;
 //                     final uri = Uri.parse(url);
-//                     if (await canLaunchUrl(uri)) { await launchUrl(uri, mode: LaunchMode.externalApplication); }
+//                     if (await canLaunchUrl(uri)) {
+//                       await launchUrl(uri, mode: LaunchMode.externalApplication);
+//                     }
 //                   },
 //                 );
 //               },
 //             ),
 //           ),
-//           _buildComposer(),
+//           _buildComposer(canSend),
 //         ],
 //       ),
 //     );
-//   }
-//
-//   String _subtitleText() {
-//     if (!_listening) return 'connecting…';
-//     if (!_seedArrived) return 'loading history…';
-//     if (_typingUserIds.isNotEmpty) return 'typing…';
-//     return 'online';
 //   }
 //
 //   Widget _buildTypingRow() {
@@ -2587,64 +2765,36 @@ class _CallChip extends StatelessWidget {
 //     );
 //   }
 //
-//   Widget _buildComposer() {
-//     final canSend = _textCtrl.text.trim().isNotEmpty && !_sending;
-//
+//   Widget _buildComposer(bool canSend) {
 //     return SafeArea(
 //       top: false,
 //       child: Container(
-//         color: const Color(0xFFF7F7F7), // Telegram-like bottom bar
+//         color: const Color(0xFFF7F7F7),
 //         padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
 //         child: Row(
 //           children: [
-//             // Telegram-style attach (paperclip). Still calls _sendImage().
 //             IconButton(
 //               tooltip: 'Attach',
 //               onPressed: _sendImage,
 //               icon: const Icon(Icons.attach_file),
 //             ),
-//
-//             // Rounded, filled input like Telegram
 //             Expanded(
 //               child: TextField(
-//               controller: _textCtrl,
-//               minLines: 1,
-//               maxLines: 4,
-//               onChanged: (_) => _sendTypingStart(),
-//               decoration: const InputDecoration(hintText: 'Message', isDense: true, border: OutlineInputBorder()),
+//                 controller: _textCtrl,
+//                 minLines: 1,
+//                 maxLines: 4,
+//                 onChanged: (_) {
+//                //   _sendTypingStart();
+//                   if (mounted) setState(() {}); // update send button state immediately
+//                 },
+//                 decoration: const InputDecoration(
+//                   hintText: 'Message',
+//                   isDense: true,
+//                   border: OutlineInputBorder(),
+//                 ),
+//               ),
 //             ),
-//
-//               // Container(
-//               //   decoration: BoxDecoration(
-//               //     color: Colors.white,
-//               //     borderRadius: BorderRadius.circular(24),
-//               //     boxShadow: const [
-//               //       BoxShadow(color: Colors.black12, blurRadius: 1, offset: Offset(0, 1)),
-//               //     ],
-//               //   ),
-//               //   padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
-//               //   child: TextField(
-//               //     controller: _textCtrl,
-//               //     minLines: 1,
-//               //     maxLines: 5,
-//               //     onChanged: (_) {
-//               //       _sendTypingStart();
-//               //       // update send button enabled/disabled instantly
-//               //       if (mounted) setState(() {});
-//               //     },
-//               //     style: const TextStyle(fontSize: 16),
-//               //     decoration: const InputDecoration(
-//               //       hintText: 'Message',
-//               //       isCollapsed: true,
-//               //       border: InputBorder.none,
-//               //     ),
-//               //   ),
-//               // ),
-//             ),
-//
 //             const SizedBox(width: 8),
-//
-//             // Telegram-style circular Send button
 //             SizedBox(
 //               width: 40,
 //               height: 40,
@@ -2659,9 +2809,12 @@ class _CallChip extends StatelessWidget {
 //                         ? const SizedBox(
 //                       width: 18,
 //                       height: 18,
-//                       child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(Colors.white)),
+//                       child: CircularProgressIndicator(
+//                         strokeWidth: 2,
+//                         valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+//                       ),
 //                     )
-//                         :  IconButton(onPressed: _sending ? null : _sendText, icon: const Icon(Icons.send)),
+//                         : const Icon(Icons.send, color: Colors.white),
 //                   ),
 //                 ),
 //               ),
@@ -2671,37 +2824,15 @@ class _CallChip extends StatelessWidget {
 //       ),
 //     );
 //   }
-//
-//
-// // Widget _buildComposer() {
-//   //   return SafeArea(
-//   //     top: false,
-//   //     child:
-//   //     Padding(
-//   //       padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
-//   //       child: Row(
-//   //         children: [
-//   //           IconButton(tooltip: 'Image', onPressed: _sendImage, icon: const Icon(Icons.image)),
-//   //           Expanded(
-//   //             child: TextField(
-//   //               controller: _textCtrl,
-//   //               minLines: 1,
-//   //               maxLines: 5,
-//   //               onChanged: (_) => _sendTypingStart(),
-//   //               decoration: const InputDecoration(hintText: 'Message', isDense: true, border: OutlineInputBorder()),
-//   //             ),
-//   //           ),
-//   //           const SizedBox(width: 8),
-//   //           IconButton(onPressed: _sending ? null : _sendText, icon: const Icon(Icons.send)),
-//   //         ],
-//   //       ),
-//   //     ),
-//   //   );
-//   // }
 // }
 //
+// // ===== Helpers outside widget =====
 // DateTime _parseIso(dynamic v) {
-//   if (v is String) { try { return DateTime.parse(v).toUtc(); } catch (_) {} }
+//   if (v is String) {
+//     try {
+//       return DateTime.parse(v).toUtc();
+//     } catch (_) {}
+//   }
 //   return DateTime.now().toUtc();
 // }
 //
@@ -2724,6 +2855,9 @@ class _CallChip extends StatelessWidget {
 //   double uploadProgress; // 0..100 for pending file uploads
 //   MessageStatus status;
 //
+//   // NEW: stable ordering fallback
+//   int arriveSeq;
+//
 //   ChatMessage({
 //     required this.id,
 //     required this.tempId,
@@ -2740,6 +2874,7 @@ class _CallChip extends StatelessWidget {
 //     required this.existsOnTelegram,
 //     required this.uploadProgress,
 //     this.status = MessageStatus.sent,
+//     this.arriveSeq = -1,
 //   });
 //
 //   factory ChatMessage.fromJson(Map<String, dynamic> m) {
@@ -2756,13 +2891,16 @@ class _CallChip extends StatelessWidget {
 //       mediaLink: m['media_link']?.toString(),
 //       call: (m['call'] is Map) ? CallInfo.fromJson(m['call'] as Map<String, dynamic>) : null,
 //       deletedOnTelegram: m['deleted_on_telegram'] == true,
-//       existsOnTelegram: m['exists_on_telegram'] != false, // default true when msg_id exists
+//       // default true unless explicitly false
+//       existsOnTelegram: m['exists_on_telegram'] != false,
 //       uploadProgress: 0.0,
 //       status: MessageStatus.sent,
+//       arriveSeq: -1,
 //     );
 //   }
 //
 //   void mergeFrom(ChatMessage other) {
+//     // Keep existing arriveSeq to preserve stable order.
 //     id = other.id ?? id;
 //     tempId = other.tempId ?? tempId;
 //     text = other.text.isNotEmpty ? other.text : text;
@@ -2784,7 +2922,7 @@ class _CallChip extends StatelessWidget {
 //     if ((mediaType ?? 'text') != 'text' && (text.isEmpty)) {
 //       return '[${mediaType ?? 'media'}]';
 //     }
-//     return text;
+//     return text.isEmpty ? '[text]' : text;
 //   }
 // }
 //
@@ -2818,8 +2956,8 @@ class _CallChip extends StatelessWidget {
 //   final ChatMessage msg;
 //   final VoidCallback? onLongPress;
 //   final VoidCallback? onTapMedia;
-//   final ChatMessage? Function(int id) findById; // NEW
-//   final VoidCallback? onSwipeReply;             // NEW
+//   final ChatMessage? Function(int id) findById;
+//   final VoidCallback? onSwipeReply;
 //
 //   const _MessageBubble({
 //     super.key,
@@ -2842,7 +2980,7 @@ class _CallChip extends StatelessWidget {
 //           GestureDetector(
 //             onLongPress: onLongPress,
 //             onHorizontalDragEnd: (details) {
-//               if ((details.primaryVelocity ?? 0) > 150) { // swipe → reply
+//               if ((details.primaryVelocity ?? 0) > 150) {
 //                 if (onSwipeReply != null) onSwipeReply!();
 //               }
 //             },
@@ -2858,7 +2996,7 @@ class _CallChip extends StatelessWidget {
 //     final ghost = (msg.existsOnTelegram == false) || (msg.status == MessageStatus.pending);
 //     final base = _bubbleCore(context);
 //
-//     // text/call → overall opacity
+//     // text/call → overall opacity only
 //     if ((msg.mediaType ?? 'text') == 'text' || (msg.mediaType ?? '').startsWith('call_')) {
 //       return Opacity(opacity: ghost ? 0.65 : 1.0, child: base);
 //     }
@@ -2903,10 +3041,12 @@ class _CallChip extends StatelessWidget {
 //     final mt = (msg.mediaType ?? 'text');
 //     final List<Widget> children = [];
 //
-//     // Reply preview (real content)
+//     // Reply preview (fallback visible)
 //     if (msg.replyTo != null) {
 //       final ref = findById(msg.replyTo!);
-//       children.add(_ReplyPreview(id: msg.replyTo!, text: ref?.previewText() ?? '', mediaType: ref?.mediaType ?? 'text'));
+//       final rpText = ref?.previewText() ?? '[unavailable]';
+//       final rpType = ref?.mediaType ?? 'text';
+//       children.add(_ReplyPreview(id: msg.replyTo!, text: rpText, mediaType: rpType));
 //     }
 //
 //     if (mt == 'text') {
@@ -2923,7 +3063,8 @@ class _CallChip extends StatelessWidget {
 //       } else {
 //         children.add(const Text('[empty]', style: TextStyle(fontSize: 15, fontStyle: FontStyle.italic)));
 //       }
-//     } else if (mt == 'image') {
+//     }
+//     else if (mt == 'image') {
 //       final ghost = (msg.existsOnTelegram == false) || (msg.status == MessageStatus.pending);
 //       if ((msg.mediaLink ?? '').isNotEmpty) {
 //         Widget img = Image.network(
@@ -2931,7 +3072,9 @@ class _CallChip extends StatelessWidget {
 //           fit: BoxFit.cover,
 //           loadingBuilder: (context, child, progress) {
 //             if (progress == null) return child;
-//             final v = progress.expectedTotalBytes == null ? null : progress.cumulativeBytesLoaded / (progress.expectedTotalBytes!);
+//             final v = progress.expectedTotalBytes == null
+//                 ? null
+//                 : progress.cumulativeBytesLoaded / (progress.expectedTotalBytes!);
 //             return SizedBox(height: 180, width: 240, child: Center(child: CircularProgressIndicator(value: v)));
 //           },
 //           errorBuilder: (_, __, ___) => Container(
@@ -2943,19 +3086,6 @@ class _CallChip extends StatelessWidget {
 //           ),
 //         );
 //         if (ghost) {
-//           img = Opacity(
-//             opacity: 0.65,
-//             child: const ColorFiltered(
-//               colorFilter: ColorFilter.matrix(<double>[
-//                 0.2126, 0.7152, 0.0722, 0, 0,
-//                 0.2126, 0.7152, 0.0722, 0, 0,
-//                 0.2126, 0.7152, 0.0722, 0, 0,
-//                 0,      0,      0,      1, 0,
-//               ]),
-//               child: SizedBox.shrink(),
-//             ),
-//           );
-//           // wrap real image inside ColorFiltered
 //           img = Opacity(
 //             opacity: 0.65,
 //             child: ColorFiltered(
@@ -2988,7 +3118,9 @@ class _CallChip extends StatelessWidget {
 //           ),
 //         ));
 //       }
-//     } else if (mt.startsWith('call_') && msg.call != null) {
+//     }
+//
+//     else if (mt.startsWith('call_') && msg.call != null) {
 //       children.add(_CallChip(call: msg.call!));
 //     } else {
 //       // generic file/video/audio/voice/sticker
@@ -3019,7 +3151,10 @@ class _CallChip extends StatelessWidget {
 //     return Column(
 //       crossAxisAlignment: CrossAxisAlignment.start,
 //       children: [
-//         LinearProgressIndicator(value: (msg.uploadProgress > 0 && msg.uploadProgress <= 100) ? msg.uploadProgress / 100.0 : null),
+//         LinearProgressIndicator(
+//             value: (msg.uploadProgress > 0 && msg.uploadProgress <= 100)
+//                 ? msg.uploadProgress / 100.0
+//                 : null),
 //         const SizedBox(height: 4),
 //         Text('${msg.uploadProgress.toStringAsFixed(1)}%'),
 //       ],
@@ -3037,7 +3172,7 @@ class _CallChip extends StatelessWidget {
 //   final int id;
 //   final String text;
 //   final String mediaType;
-//   const _ReplyPreview({required this.id, required this.text, required this.mediaType});
+//   const _ReplyPreview({super.key, required this.id, required this.text, required this.mediaType});
 //
 //   @override
 //   Widget build(BuildContext context) {
@@ -3064,7 +3199,7 @@ class _CallChip extends StatelessWidget {
 //
 // class _CallChip extends StatelessWidget {
 //   final CallInfo call;
-//   const _CallChip({required this.call});
+//   const _CallChip({super.key, required this.call});
 //
 //   @override
 //   Widget build(BuildContext context) {
@@ -3095,3 +3230,4 @@ class _CallChip extends StatelessWidget {
 //     return '$m:$ss';
 //   }
 // }
+

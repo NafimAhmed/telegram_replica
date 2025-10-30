@@ -455,7 +455,7 @@ class _TelegraphDrawerState extends State<TelegraphDrawer> {
                         title: Text("Special Features")),
                     ListTile(
                       leading: const Icon(Icons.chat_bubble_outline),
-                      title: const Text("New Chat"),
+                      title: const Text("New Group"),
                       onTap: () {
                         final p = Provider.of<TelegraphProvider>(context, listen: false);
 
