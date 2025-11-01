@@ -187,7 +187,15 @@ class TelegraphProvider with ChangeNotifier {
       if (textMsg.isEmpty && lastMsg is Map && lastMsg["media"] != null) {
         textMsg = "📸 Media message";
       }
+      // ✅ server থেকে যা এসেছে সেটাই নেবো
+      final bool? serverIsGroup = (d["is_group"] is bool) ? d["is_group"] as bool : null;
 
+      // 🔒 fallback logic (যদি কারও ডাটা missing হয়)
+      final bool isGroup = serverIsGroup ??
+          (d["is_channel"] == true) ||
+              (d["type"] == "group" || d["type"] == "megagroup" || d["type"] == "channel") ||
+              // অনেক সময়ে basic group এ access_hash null থাকে
+              ((d["is_user"] != true) && d["access_hash"] == null);
       return {
         "id": d["id"],
         "name": (d["first_name"] ?? "Unknown").toString(),
@@ -195,6 +203,7 @@ class TelegraphProvider with ChangeNotifier {
         "username": user.toString(),
         "last_message": textMsg,
         "unread_count": d["unread_count"] ?? 0,
+        "is_group": isGroup,
         "avatar": "$baseUrl/avatar_redirect?phone=$phone&username=@$user",
       };
     }).toList();

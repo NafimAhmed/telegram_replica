@@ -133,6 +133,7 @@ class _TelegraphHomeState extends State<TelegraphHome>
           print(p.dialogs.length,);
           final d = p.dialogs[i];
           print(d["access_hash"],);
+          print(d["is_group"],);
           final lastMsg = d["last_message"] ?? "";
 
           return ListTile(
@@ -171,6 +172,7 @@ class _TelegraphHomeState extends State<TelegraphHome>
               final chatIdValue = d["id"];
               final accessHash = d["access_hash"];
               final isGroup = d["is_group"] == true;
+              print(isGroup);
               if (chatIdValue == null) {
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(
@@ -180,7 +182,20 @@ class _TelegraphHomeState extends State<TelegraphHome>
                 );
                 return;
               }
-
+              // isGroup? Navigator.push(
+              //   context,
+              //   MaterialPageRoute(
+              //     builder: (_) => ChatScreen(
+              //       phone: p.phoneNumber,
+              //       chatId: chatIdValue is int
+              //           ? chatIdValue
+              //           : int.tryParse(chatIdValue.toString()) ?? 0,
+              //       accessHash: null,
+              //       name: d["name"],
+              //       username: '',
+              //     ),
+              //   ),
+              // ):
               Navigator.push(
                 context,
                 MaterialPageRoute(
@@ -192,7 +207,7 @@ class _TelegraphHomeState extends State<TelegraphHome>
                     name: d["name"],
                     username: d["username"],
                     accessHash: isGroup
-                        ? null // ✅ যদি group হয়, তাহলে null যাবে
+                        ? null
                         : (accessHash is int
                         ? accessHash
                         : int.tryParse(accessHash.toString()) ?? 0),
