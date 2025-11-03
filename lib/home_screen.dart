@@ -574,7 +574,7 @@ class _TelegraphAppState extends State<TelegraphApp> {
     final p = Provider.of<TelegraphProvider>(context);
 
     return MaterialApp(
-      title: 'Telegraph',
+      title: 'TG Hub',
       debugShowCheckedModeBanner: false,
       themeMode: p.isDark ? ThemeMode.dark : ThemeMode.light,
       darkTheme: ThemeData.dark().copyWith(
