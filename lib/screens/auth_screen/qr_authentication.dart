@@ -24,7 +24,8 @@ class _QrLoginScreenState extends State<QrLoginScreen> {
   Timer? _timer;
 
   // তোমার Flask সার্ভার IP
-  final String baseUrl = "http://192.168.0.247:8080";
+  final String baseUrl = "http://156.245.198.71:5080";
+  // final String baseUrl = "http://192.168.0.247:8080";
 
   @override
   void initState() {

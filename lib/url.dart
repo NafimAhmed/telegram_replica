@@ -1,4 +1,5 @@
-String urlLocal="http://192.168.0.247:8080";
+//String urlLocal="http://192.168.0.247:8080";
+String urlLocal="http://156.245.198.71:5080";
 
 //
 // // chat_screen.dart

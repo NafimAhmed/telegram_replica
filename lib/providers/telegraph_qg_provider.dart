@@ -20,7 +20,8 @@ class TelegraphProvider with ChangeNotifier {
   List<Map<String, dynamic>> accounts = [];
   List<Map<String, dynamic>> messages = [];
 
-  final String baseUrl = "http://192.168.0.247:8080";
+  //final String baseUrl = "http://192.168.0.247:8080";
+  final String baseUrl = "http://156.245.198.71:5080";
   final GoogleTranslator _translator = GoogleTranslator();
 
   bool _initialized = false;

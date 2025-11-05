@@ -1437,6 +1437,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void initState() {
     super.initState();
     _connect();
+
   }
 
   @override
@@ -2107,7 +2108,22 @@ class _ChatScreenState extends State<ChatScreen> {
           icon: const Icon(Icons.close),
           onPressed: _exitSelection,
         )
-            : null,
+            :
+        IconButton(
+          tooltip: 'Cancel',
+          icon: const Icon(Icons.arrow_back_ios_new),
+          onPressed: ()async{
+            Navigator.pop(context);
+            print('1122321232121');
+            final p = Provider.of<TelegraphProvider>(context, listen: false);
+            print(p.phoneNumber);
+            print('.......');
+            await p.fetchDialogs(p.phoneNumber);
+
+
+          },
+        ),
+        // null,
         titleSpacing: 0,
         title: _selectMode
             ? Text('$_selectedCount selected')
